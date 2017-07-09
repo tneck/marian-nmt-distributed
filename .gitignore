@@ -1,5 +1,5 @@
-# Config files from CMake
-src/common/version.h
+# IDEA
+.idea/*
 
 # Compiled Object files
 *.slo
@@ -33,17 +33,17 @@ src/common/version.h
 *.out
 *.app
 
-# Temporaty files created by editors
+# Temporary files created by editors
 .*.sw*
 *~
 
 # CMake files
 build
+cmake-build-debug/*
 
 # Examples
 examples/*/*.gz
 examples/mnist/*ubyte
 
-# Contrib
-/.ycm_extra_conf.py
-/.vimrc
+# Other
+src/thrust
