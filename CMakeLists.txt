@@ -51,6 +51,13 @@ if(USE_CUDNN)
     endif(CUDNN_FOUND)
 endif(USE_CUDNN)
 
+find_package(MPI)
+if(MPI_FOUND)
+    include_directories(${MPI_INCLUDE_PATH})
+    set(EXT_LIBS ${EXT_LIBS} ${MPI_LIBRARIES})
+    add_definitions(-DMPI_FOUND=1)
+endif(MPI_FOUND)
+
 find_package(ZLIB)
 if(ZLIB_FOUND)
     include_directories(${ZLIB_INCLUDE_DIRS})
