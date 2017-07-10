@@ -14,20 +14,20 @@ int main(int argc, char** argv) {
   auto devices = options->get<std::vector<size_t>>("devices");
 
   int comm_world_size = 0;
-  bool suitable_thread_mode;
+  bool suitable_thread_mode = false;
 
   #if MPI_FOUND
   int provided_thread_mode = 0;
   MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_mode);
   MPI_Comm_size(MPI_COMM_WORLD, &comm_world_size);
-  suitable_thread_mode = (provided_thread_mode >= MPI_THREAD_MULTIPLE);
+  suitable_thread_mode = (provided_thread_mode >= MPI_THREAD_SERIALIZED);
   #endif
 
   if (comm_world_size > 1 && suitable_thread_mode) {
-    // Launch distributed asynch graph group
+    // Launch node-distributed asynch graph group
     // @TODO: Launch DistAsyncGraphGroup
   } else {
-    // Launch non-distributed graph group
+    // Launch non node-distributed graph group
     if(devices.size() > 1)
       WrapModelType<Train, AsyncGraphGroup>(options)->run();
     else
