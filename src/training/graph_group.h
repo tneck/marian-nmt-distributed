@@ -721,9 +721,7 @@ public:
 
 private:
 
-  /** New variables */
-
-  /** Variables inherited from AsyncGraphGroup */
+  /** Node local variables copied from AsyncGraphGroup */
 
   bool first_{true};
 
@@ -740,17 +738,17 @@ private:
 
   std::vector<SparseTensor> localSparseGrads_;
   std::vector<SparseTensor> sparseGrads_;
-  std::vector<SparseTensor> tmpSparseDelta;
-  std::vector<std::vector<SparseTensor>> localSparseDelta;
+  std::vector<SparseTensor> tmpSparseDelta_;
+  std::vector<std::vector<SparseTensor>> localSparseDelta_;
 
   // version number per-shard
-  std::vector<int> globalVersionNumber;
+  std::vector<int> nodeGlobalVersionNumber_;
 
   // each worker has the version number obtained from each shard
-  std::vector<std::vector<int>> localVersionNumbers;
+  std::vector<std::vector<int>> localVersionNumbers_;
 
-  std::vector<std::vector<GradientDrop>> fetchDropper;
-  std::vector<Tensor> tmpTensor;
+  std::vector<std::vector<GradientDrop>> fetchDropper_;
+  std::vector<Tensor> tmpTensor_;
 
   std::vector<std::vector<Tensor>> params_;
   std::vector<Ptr<TensorAllocator>> paramsAlloc_;
@@ -772,6 +770,40 @@ private:
 
   double drop_rate_{0};
   int history_size_{1};
+
+  /** Node distribution variables */
+
+  // MPI variables
+
+  int mpi_my_rank_ = 0;
+  int mpi_comm_world_size = 1;
+
+  static const int MPI_TAG_PARAM_PUSH_;
+  static const int MPI_TAG_GRAD_PUSH_;
+  static const int MPI_TAG_STOP_;
+
+  // Server (shard) thread variables
+
+  std::thread serverShardThread_;
+
+  Tensor serverShardParams_;
+  Tensor serverShardGrads_;
+
+  Ptr<OptimizerBase> serverShardOpt_;
+  std::mutex mutexServerShardOpt_;
+
+  // Client communication thread variables
+
+  std::thread clientCommThread_;
+
+  Tensor remoteCommBufferParams_;
+  Tensor remoteCommBufferGrads_; // @TODO: Make one of these per local shard?
+
+  bool exchangedCommBuffer_;
+  std::mutex mutexExchangedWCommBuffer_;
+  std::condition_variable cvExchangedWCommBuffer_;
+
+  size_t * remoteShardSizes_; // @TODO: Clear dynamic variable in destructor
 
   std::vector<Ptr<TensorAllocator>> allocators;
   Tensor newTensor(int size, int device) {
@@ -823,8 +855,8 @@ private:
             int latestVersion = 0;
 
             if(history_size_ > 1) {
-              int pastVersion = globalVersionNumber[idx] % history_size_;
-              latestVersion = ++globalVersionNumber[idx] % history_size_;
+              int pastVersion = nodeGlobalVersionNumber_[idx] % history_size_;
+              latestVersion = ++nodeGlobalVersionNumber_[idx] % history_size_;
               params_[latestVersion][idx]->copyFrom(params_[pastVersion][idx]);
             }
 
@@ -859,41 +891,41 @@ private:
             // individual mutex per-shard
             std::lock_guard<std::mutex> guard(shardSync_[idx]);
             // obtain the delta
-            int latestVersion = globalVersionNumber[idx] % history_size_;
+            int latestVersion = nodeGlobalVersionNumber_[idx] % history_size_;
             int currVersion
-                = localVersionNumbers[worker_id][idx] % history_size_;
+                = localVersionNumbers_[worker_id][idx] % history_size_;
 
             // check if the current version is too old
-            if(globalVersionNumber[idx] - localVersionNumbers[worker_id][idx]
+            if(nodeGlobalVersionNumber_[idx] - localVersionNumbers_[worker_id][idx]
                >= history_size_)
-              currVersion = (1 + globalVersionNumber[idx])
+              currVersion = (1 + nodeGlobalVersionNumber_[idx])
                             % history_size_;  // if so, pick the best you can do
 
             // if already latest
-            if(globalVersionNumber[idx] == localVersionNumbers[worker_id][idx])
+            if(nodeGlobalVersionNumber_[idx] == localVersionNumbers_[worker_id][idx])
               return;
 
             // get delta : param latest version - current param (locally)
             Element(_1 = _2 - _3,
-                    tmpTensor[idx],
+                    tmpTensor_[idx],
                     params_[latestVersion][idx],
                     params_[currVersion][idx]);
             cudaStreamSynchronize(0);
 
             // get sparse delta
-            fetchDropper[worker_id][idx]->dropGraph(
-                tmpTensor[idx], tmpSparseDelta[idx], drop_rate_);
+            fetchDropper_[worker_id][idx]->dropGraph(
+                tmpTensor_[idx], tmpSparseDelta_[idx], drop_rate_);
             cudaStreamSynchronize(0);
 
             // move sparse delta
-            localSparseDelta[worker_id][idx]->copyFrom(tmpSparseDelta[idx]);
+            localSparseDelta_[worker_id][idx]->copyFrom(tmpSparseDelta_[idx]);
             cudaStreamSynchronize(0);
 
-            localSparseDelta[worker_id][idx]->scatterAdd(
+            localSparseDelta_[worker_id][idx]->scatterAdd(
                 oldParams->subtensor(pos, grads_[idx]->size()));
             cudaStreamSynchronize(0);
 
-            localVersionNumbers[worker_id][idx] = globalVersionNumber[idx];
+            localVersionNumbers_[worker_id][idx] = nodeGlobalVersionNumber_[idx];
 
           },
           i,
@@ -933,8 +965,8 @@ private:
               cudaStreamSynchronize(0);
 
               // apply and increment your version number
-              int pastVersion = globalVersionNumber[idx] % history_size_;
-              int latestVersion = ++globalVersionNumber[idx] % history_size_;
+              int pastVersion = nodeGlobalVersionNumber_[idx] % history_size_;
+              int latestVersion = ++nodeGlobalVersionNumber_[idx] % history_size_;
               params_[latestVersion][idx]->copyFrom(params_[pastVersion][idx]);
               shardOpt_[idx]->update(params_[latestVersion][idx], grads_[idx]);
 
@@ -967,12 +999,12 @@ private:
       THREAD_GUARD(builders_[i]->build(graphs_[i], batch);
                        graphs_[i]->forward(););
 
-      globalVersionNumber.push_back(0);
+      nodeGlobalVersionNumber_.push_back(0);
       std::vector<int> localVersion;
       for(int j = 0; j < graphs_.size(); j++)
         localVersion.push_back(0);
 
-      localVersionNumbers.push_back(localVersion);
+      localVersionNumbers_.push_back(localVersion);
     }
 
     if(params_[0].size() == 0) {
@@ -998,7 +1030,7 @@ private:
         }
 
         if(drop_rate_)
-          tmpTensor.push_back(newTensor(__size__, device));
+          tmpTensor_.push_back(newTensor(__size__, device));
         pos += __size__;
       }
     }
@@ -1047,13 +1079,13 @@ private:
             SparseTensor(new SparseTensorBase(sparseCap, device)));
         localSparseGrads_.push_back(
             SparseTensor(new SparseTensorBase(sparseCap, device)));
-        tmpSparseDelta.push_back(SparseTensor(
+        tmpSparseDelta_.push_back(SparseTensor(
             new SparseTensorBase(sparseCap / devices_.size(), device)));
         std::vector<SparseTensor> tmp;
         for(int i = 0; i < devices_.size(); i++)
           tmp.push_back(SparseTensor(
               new SparseTensorBase(sparseCap / devices_.size(), device)));
-        localSparseDelta.push_back(tmp);
+        localSparseDelta_.push_back(tmp);
       }
     }
   }
@@ -1088,7 +1120,7 @@ private:
         std::vector<GradientDrop> tmp;
         for(int i = 0; i < devices_.size(); i++)
           tmp.push_back(GradientDrop(new GradientDropBase()));
-        fetchDropper.push_back(tmp);
+        fetchDropper_.push_back(tmp);
       }
 
       auto costNode = builder->build(graph, batch);
@@ -1097,7 +1129,7 @@ private:
         sparseFetchParams(graph->params()->vals(), my_id);
       else
         fetchParams(graph->params()->vals(),
-                    params_[globalVersionNumber[my_id] % history_size_]);
+                    params_[nodeGlobalVersionNumber_[my_id] % history_size_]);
 
       graph->forward();
       float cost = costNode->scalar();
