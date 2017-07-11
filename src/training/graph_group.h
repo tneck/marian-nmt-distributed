@@ -1,5 +1,9 @@
 #pragma once
 
+#if MPI_FOUND
+#include "mpi.h"
+#endif
+
 #include <future>
 #include <thread>
 
@@ -721,7 +725,11 @@ public:
 
 private:
 
-  /** Node local variables copied from AsyncGraphGroup */
+  /*
+   *
+   * Node local variables copied from AsyncGraphGroup
+   *
+   */
 
   bool first_{true};
 
@@ -758,7 +766,7 @@ private:
 
   std::vector<Ptr<OptimizerBase>> shardOpt_;
 
-  int shardSize_;
+  int gpuShardSize_;
   int tau_{1};
 
   std::vector<Tensor> paramsAvg_;
@@ -771,39 +779,49 @@ private:
   double drop_rate_{0};
   int history_size_{1};
 
-  /** Node distribution variables */
+  /*
+   *
+   * Node distribution variables (new)
+   *
+   */
 
   // MPI variables
 
-  int mpi_my_rank_ = 0;
-  int mpi_comm_world_size = 1;
+  int mpi_my_rank_{0};
+  int mpi_comm_world_size_{1};
 
-  static const int MPI_TAG_PARAM_PUSH_;
-  static const int MPI_TAG_GRAD_PUSH_;
-  static const int MPI_TAG_STOP_;
+  static const int MPI_TAG_PARAM_PUSH_{1};
+  static const int MPI_TAG_GRAD_PUSH_{2};
+  static const int MPI_TAG_STOP_{3};
 
   // Server (shard) thread variables
 
   std::thread serverShardThread_;
 
-  Tensor serverShardParams_;
-  Tensor serverShardGrads_;
+  Ptr<std::vector<float>> serverShardParams_; // @TODO: Shared pointer necessary? + Verify auto delete/clear
+  Ptr<std::vector<float>> serverShardGrads_;
 
-  Ptr<OptimizerBase> serverShardOpt_;
+  Ptr<OptimizerBase> serverShardOpt_; // @TODO: Could also use optimizer from GraphGroup
   std::mutex mutexServerShardOpt_;
 
   // Client communication thread variables
 
   std::thread clientCommThread_;
 
-  Tensor remoteCommBufferParams_;
-  Tensor remoteCommBufferGrads_; // @TODO: Make one of these per local shard?
+  Ptr<std::vector<float>> clientCommBufferParams_;
+  Ptr<std::vector<float>> clientCommBufferGrads_; // @TODO: Make one of these per local shard?
 
-  bool exchangedCommBuffer_;
-  std::mutex mutexExchangedWCommBuffer_;
-  std::condition_variable cvExchangedWCommBuffer_;
+  bool commBufferFull{false}; // @TODO: Consider less ambiguous name?
+  std::mutex mutexCommBufferFull;
+  std::condition_variable cvCommBufferFull;
 
-  size_t * remoteShardSizes_; // @TODO: Clear dynamic variable in destructor
+  size_t * nodeShardSizes_; // @TODO: Clear dynamic variable in destructor
+
+  /*
+   *
+   * Node local methods copied from AsyncGraphGroup
+   *
+   */
 
   std::vector<Ptr<TensorAllocator>> allocators;
   Tensor newTensor(int size, int device) {
@@ -832,7 +850,7 @@ private:
           idx,
           pos));
 
-      pos += shardSize_;
+      pos += gpuShardSize_;
     }
     for(auto&& t : threads) {
       t.join();
@@ -871,7 +889,7 @@ private:
           idx,
           pos));
 
-      pos += shardSize_;
+      pos += gpuShardSize_;
     }
     for(auto&& t : threads)
       t.join();
@@ -931,7 +949,7 @@ private:
           i,
           p));
 
-      p += shardSize_;
+      p += gpuShardSize_;
     }
     for(auto&& t : threads) {
       t.join();
@@ -980,7 +998,7 @@ private:
             idx,
             pos));
 
-        pos += shardSize_;
+        pos += gpuShardSize_;
       }
       for(auto&& t : threads)
         t.join();
@@ -992,6 +1010,7 @@ private:
     Element(_1 = (decay * _1) + ((1.f - decay) * _2), paramsAvg, params);
   }
 
+  // Extracted from original 'execute(batch)' method
   void initFirstRun(Ptr<data::Batch> batch) {
     // initialize the parameters
     for(size_t i = 0; i < graphs_.size(); ++i) {
@@ -1009,12 +1028,12 @@ private:
 
     if(params_[0].size() == 0) {
       int totalSize = graphs_[0]->params()->vals()->size();
-      shardSize_ = ceil(totalSize / devices_.size());
+      gpuShardSize_ = ceil(totalSize / devices_.size());
 
       int pos = 0;
       // parameter sharding
       for(auto device : devices_) {
-        int __size__ = min(shardSize_, totalSize);
+        int __size__ = min(gpuShardSize_, totalSize);
         totalSize -= __size__;
 
         for(int h_id = 0; h_id < history_size_; h_id++) {
@@ -1038,7 +1057,7 @@ private:
       int totalSize = graphs_[0]->params()->vals()->size();
 
       for(auto device : devices_) {
-        int __size__ = min(shardSize_, totalSize);
+        int __size__ = min(gpuShardSize_, totalSize);
         totalSize -= __size__;
         Tensor grad_;
         Ptr<TensorAllocator> allocator_ = New<TensorAllocator>(device);
@@ -1055,7 +1074,7 @@ private:
 
         int i = 0;
         for(auto device : devices_) {
-          int __size__ = min(shardSize_, totalSize);
+          int __size__ = min(gpuShardSize_, totalSize);
           totalSize -= __size__;
           Tensor paramAvg;
           Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
@@ -1088,6 +1107,125 @@ private:
         localSparseDelta_.push_back(tmp);
       }
     }
+  }
+
+  /*
+   *
+   * Node distribution methods
+   *
+   */
+
+  void initMPI() {
+    #if MPI_FOUND
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_comm_world_size_);
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_my_rank_);
+    #endif
+  }
+
+  void initServerShard() {
+    // Initialize server shard sizes for all nodes (remote + current)
+    nodeShardSizes_ = new size_t[mpi_comm_world_size_];
+    size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
+    size_t nodeShardSize = ceilf(((float) totalParamsGradsSize) / mpi_comm_world_size_);
+    size_t remainingTotalSize = totalParamsGradsSize;
+    for (int node = 0; node < mpi_comm_world_size_; node++) {
+      size_t size = std::min(nodeShardSize, remainingTotalSize);
+      nodeShardSizes_[node] = size;
+      remainingTotalSize -= size;
+    }
+    // Allocate this shard's params and grads
+    serverShardParams_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
+    serverShardGrads_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
+    // Initialize server shard optimizer
+    serverShardOpt_ = Optimizer(options_); // @TODO: Move to constructor?
+  }
+
+  void initRemoteCommunicator() {
+    // Allocate client's communication buffer params and grads
+    size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
+    clientCommBufferParams_ = Ptr<std::vector<float>>(new std::vector<float>(totalParamsGradsSize));
+    clientCommBufferGrads_ = Ptr<std::vector<float>>(new std::vector<float>(totalParamsGradsSize));
+  }
+
+  void launchServerShardThread() {
+    #if MPI_FOUND
+    serverShardThread_ = std::thread( [this] {
+      MPI_Status status;
+      do {
+        // Receive grads from any clien
+        MPI_Recv(serverShardParams_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
+
+        // Update server shard parameters with received gradients @TODO: Consider using GPU instead of CPU for this?
+        {
+          std::lock_guard<std::mutex> guard(mutexServerShardOpt_);
+          // @TODO: Implement serverShardOpt_->update(serverShardParams_, serverShardGrads_);
+        }
+
+        // Push updated params to same client
+        MPI_Send(serverShardParams_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD);
+
+      } while (true/*@TODO: Add stop condition, e.g. message length*/);
+    });
+    #endif
+  }
+
+  void launchClientCommunicationThread() {
+    #if MPI_FOUND
+    clientCommThread_ = std::thread( [this] {
+      do {
+        // Wait for graph params/grads to be copied to buffer
+        std::unique_lock<std::mutex> lock(mutexCommBufferFull);
+        while (!commBufferFull) {
+          cvCommBufferFull.wait(lock);
+        }
+
+        // Push grads to server shards and receive new params in buffer
+        synchronizeWithServerShards(clientCommBufferGrads_, clientCommBufferParams_);
+
+        // Indicate that new values can be copied to communication buffer
+        commBufferFull = false;
+
+      } while (true/*@TODO: Add stop condition*/);
+    });
+    #endif
+  }
+
+  void synchronizeWithServerShards(Ptr<std::vector<float>> newGrads, Ptr<std::vector<float>> oldParams) {
+    #if MPI_FOUND
+    size_t offset = 0; // Offset for server shard
+    for (int node = 0; node < mpi_comm_world_size_; node++) {
+      size_t size = nodeShardSizes_[node];
+
+      // If server shard is on this node, update locally, else communicate with appropriate node
+      if (node == mpi_my_rank_) {
+        std::lock_guard<std::mutex> guard(mutexServerShardOpt_);
+        // @TODO: Implement serverShardOpt_->update(oldParams, newGrads);
+      } else {
+        MPI_Send(newGrads->data(), size, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
+        MPI_Recv(oldParams->data(), size, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      }
+
+      offset += size;
+    } // @TODO: Consider probing and synchronizing with available shard instead of using strict order
+    #endif
+  }
+
+  void exchangeGraphWCommBuffer(Ptr<ExpressionGraph> graph, Ptr<std::vector<bool>> bufferParams, Ptr<std::vector<bool>> bufferGrads) {
+    // @TODO: Implement
+  }
+
+  void shutDownServerShardThread() {
+    #if MPI_FOUND
+    // @TODO: Cancel thread's loop - e.g. via MPI_Send([...], MPI_TAG_STOP_)
+    serverShardThread_.join();
+    #endif
+  }
+
+  void shutDownClientCommThread() {
+    #if MPI_FOUND
+    // @TODO: Cancel thread's loop - including escaping lock
+    clientCommThread_.join();
+    #endif
   }
 
   void execute(Ptr<data::Batch> batch) {
