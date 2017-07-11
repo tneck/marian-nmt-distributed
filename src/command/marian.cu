@@ -13,29 +13,34 @@ int main(int argc, char** argv) {
   auto options = New<Config>(argc, argv);
   auto devices = options->get<std::vector<size_t>>("devices");
 
+  bool mpiEnabled = true; // @TODO: Load from options
   int comm_world_size = 0;
   bool suitable_thread_mode = false;
 
   #if MPI_FOUND
-  int provided_thread_mode = 0;
-  MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_mode);
-  MPI_Comm_size(MPI_COMM_WORLD, &comm_world_size);
-  suitable_thread_mode = (provided_thread_mode >= MPI_THREAD_SERIALIZED);
+  if (mpiEnabled) {
+    int provided_thread_mode = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_mode);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_world_size);
+    suitable_thread_mode = (provided_thread_mode >= MPI_THREAD_SERIALIZED);
+  }
   #endif
 
   if (comm_world_size > 1 && suitable_thread_mode) {
-    // Launch node-distributed asynch graph group
-    // @TODO: Launch DistAsyncGraphGroup
+    LOG(info)->info("Launching Node Distributed Asynchronous Graph Group");
+    WrapModelType<Train, NodeDistAsyncGraphGroup>(options)->run();
+  } else if(devices.size() > 1) {
+    LOG(info)->info("Launching Asynchronous Graph Group");
+    WrapModelType<Train, AsyncGraphGroup>(options)->run();
   } else {
-    // Launch non node-distributed graph group
-    if(devices.size() > 1)
-      WrapModelType<Train, AsyncGraphGroup>(options)->run();
-    else
-      WrapModelType<Train, SingletonGraph>(options)->run();
+    LOG(info)->info("Launching Singleton Graph");
+    WrapModelType<Train, SingletonGraph>(options)->run();
   }
 
   #if MPI_FOUND
-  MPI_Finalize();
+  if (mpiEnabled) {
+    MPI_Finalize();
+  }
   #endif
 
   return 0;
