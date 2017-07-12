@@ -804,6 +804,11 @@ private:
   Ptr<OptimizerBase> serverShardOpt_; // @TODO: Could also use optimizer from GraphGroup
   std::mutex mutexServerShardOpt_;
 
+  // Used both in server thread and client communication thread
+  Tensor gpuBufferParams_;
+  Tensor gpuBufferGrads_;
+  std::mutex mutexGpuBuffer_;
+
   // Client communication thread variables
 
   std::thread clientCommThread_;
@@ -811,9 +816,12 @@ private:
   Ptr<std::vector<float>> clientCommBufferParams_;
   Ptr<std::vector<float>> clientCommBufferGrads_; // @TODO: Make one of these per local shard?
 
-  bool commBufferFull{false}; // @TODO: Consider less ambiguous name?
-  std::mutex mutexCommBufferFull;
-  std::condition_variable cvCommBufferFull;
+  Tensor clientCommGPUParams_;
+  Tensor clientCommGPUGrads_;
+
+  bool commBufferSynchronized_{true};
+  std::mutex mutexCommBufferSynchronized_;
+  std::condition_variable cvCommBufferSynchronized_;
 
   size_t * nodeShardSizes_; // @TODO: Clear dynamic variable in destructor
 
@@ -1133,32 +1141,52 @@ private:
       nodeShardSizes_[node] = size;
       remainingTotalSize -= size;
     }
-    // Allocate this shard's params and grads
+    // Initialize this shard's params and grads
     serverShardParams_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
     serverShardGrads_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
+    // Allocate memory on the first GPU for this shard's params and grads
+    size_t size = nodeShardSizes_[mpi_my_rank_];
+    gpuBufferParams_ = newTensor(size, devices_[0]);
+    gpuBufferGrads_ = newTensor(size, devices_[0]);
     // Initialize server shard optimizer
     serverShardOpt_ = Optimizer(options_); // @TODO: Move to constructor?
   }
 
   void initRemoteCommunicator() {
-    // Allocate client's communication buffer params and grads
+    // Initialize client's communication buffer params and grads
     size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
     clientCommBufferParams_ = Ptr<std::vector<float>>(new std::vector<float>(totalParamsGradsSize));
     clientCommBufferGrads_ = Ptr<std::vector<float>>(new std::vector<float>(totalParamsGradsSize));
+    // Allocate memory on the first GPU for the buffer's params and grads
+    //size_t size = nodeShardSizes_[mpi_my_rank_];
+    //clientCommGPUParams_ = newTensor(size, devices_[0]);
+    //clientCommGPUGrads_ = newTensor(size, devices_[0]); // @TODO: Use separate GPU space for client communication thread than for server thread (as commented out)?
   }
 
   void launchServerShardThread() {
     #if MPI_FOUND
     serverShardThread_ = std::thread( [this] {
       MPI_Status status;
+      size_t bytesToExchange = nodeShardSizes_[mpi_my_rank_] * sizeof(float);
       do {
-        // Receive grads from any clien
-        MPI_Recv(serverShardParams_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
+        // Receive grads from any client
+        MPI_Recv(serverShardGrads_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
 
         // Update server shard parameters with received gradients @TODO: Consider using GPU instead of CPU for this?
         {
-          std::lock_guard<std::mutex> guard(mutexServerShardOpt_);
-          // @TODO: Implement serverShardOpt_->update(serverShardParams_, serverShardGrads_);
+          std::lock_guard<std::mutex> serverShardOptGuard(mutexServerShardOpt_);
+          std::lock_guard<std::mutex> gpuBufferGuard(mutexCommBufferSynchronized_); // @TODO: These mutexes can probably be combined
+
+          // Copy grads to GPU
+          cudaMemcpy(gpuBufferGrads_->data(), serverShardGrads_->data(), bytesToExchange, cudaMemcpyHostToDevice);
+          cudaDeviceSynchronize();
+
+          // Run optimizer on GPU
+          serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_);
+
+          // Copy params from GPU
+          cudaMemcpy(serverShardParams_->data(), gpuBufferParams_->data(), bytesToExchange, cudaMemcpyDeviceToHost);
+          cudaDeviceSynchronize();
         }
 
         // Push updated params to same client
@@ -1174,16 +1202,16 @@ private:
     clientCommThread_ = std::thread( [this] {
       do {
         // Wait for graph params/grads to be copied to buffer
-        std::unique_lock<std::mutex> lock(mutexCommBufferFull);
-        while (!commBufferFull) {
-          cvCommBufferFull.wait(lock);
+        std::unique_lock<std::mutex> lock(mutexCommBufferSynchronized_);
+        while (!commBufferSynchronized_) {
+          cvCommBufferSynchronized_.wait(lock);
         }
 
         // Push grads to server shards and receive new params in buffer
         synchronizeWithServerShards(clientCommBufferGrads_, clientCommBufferParams_);
 
         // Indicate that new values can be copied to communication buffer
-        commBufferFull = false;
+        commBufferSynchronized_ = false;
 
       } while (true/*@TODO: Add stop condition*/);
     });
@@ -1198,11 +1226,24 @@ private:
 
       // If server shard is on this node, update locally, else communicate with appropriate node
       if (node == mpi_my_rank_) {
-        std::lock_guard<std::mutex> guard(mutexServerShardOpt_);
-        // @TODO: Implement serverShardOpt_->update(oldParams, newGrads);
+        std::lock_guard<std::mutex> serverShardOptGuard(mutexServerShardOpt_);
+        std::lock_guard<std::mutex> gpuBufferGuard(mutexCommBufferSynchronized_); // @TODO: These mutexes can probably be combined
+
+        // Copy grads to GPU
+        size_t bytesToExchange = nodeShardSizes_[mpi_my_rank_] * sizeof(float);
+        cudaMemcpy(gpuBufferGrads_->data(), &newGrads->at(offset), bytesToExchange, cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+
+        // Run optimizer on GPU
+        serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_);
+
+        // Copy params from GPU
+        cudaMemcpy(&oldParams->at(offset), gpuBufferParams_->data(), bytesToExchange, cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+
       } else {
-        MPI_Send(newGrads->data(), size, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
-        MPI_Recv(oldParams->data(), size, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Send(&newGrads->at(offset), size, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
+        MPI_Recv(&oldParams->at(offset), size, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
       }
 
       offset += size;
@@ -1210,7 +1251,7 @@ private:
     #endif
   }
 
-  void exchangeGraphWCommBuffer(Ptr<ExpressionGraph> graph, Ptr<std::vector<bool>> bufferParams, Ptr<std::vector<bool>> bufferGrads) {
+  void exchangeGraphWCommBuffer() {
     // @TODO: Implement
   }
 
@@ -1231,10 +1272,18 @@ private:
   void execute(Ptr<data::Batch> batch) {
     if(first_) {
       initFirstRun(batch);
+      initMPI();
+      initServerShard();
+      initRemoteCommunicator();
+      launchServerShardThread();
+      launchClientCommunicationThread();
       first_ = false;
     }
 
     auto task = [this](Ptr<data::Batch> batch) {
+      /*
+       * Node-local (copied from AsyncGraphGroup)
+       */
       static size_t i = 0;
       thread_local Ptr<ExpressionGraph> graph;
       thread_local Ptr<Builder> builder;
@@ -1317,6 +1366,31 @@ private:
             }
           }
         }*/
+      }
+      /*
+       * Node distribution
+       */
+      {
+        std::unique_lock<std::mutex> lock(mutexCommBufferSynchronized_, std::try_to_lock);
+        // If communicator waiting, exchange grads/params with GPUs communication buffers
+        if(lock.owns_lock()) {
+          size_t offset = 0;
+          for (int device = 0; device < devices_.size(); device++) {
+            std::lock_guard<std::mutex> guard(shardSync_[device]);
+
+            Ptr<Parameters> & params = graphs_[device]->params();
+            size_t size = params->vals()->size();
+            size_t bytesToExchange = size * sizeof(float);
+
+            // Copy grads from GPU to comm buffer
+            cudaMemcpy(&clientCommBufferGrads_->at(offset), params->grads()->data(), bytesToExchange, cudaMemcpyDeviceToHost);
+            // Copy params from comm buffer to GPU
+            cudaMemcpy(params->vals()->data(), &clientCommBufferParams_->at(offset), bytesToExchange, cudaMemcpyHostToDevice);
+            cudaDeviceSynchronize();
+
+            offset += size;
+          }
+        }
       }
     };
 
