@@ -710,6 +710,7 @@ public:
   }
 };
 
+// @TODO: Rename to MultiNodeAsyncGraphGroup?
 template <class Builder>
 class NodeDistAsyncGraphGroup : public GraphGroup {
 public:
@@ -819,7 +820,7 @@ private:
   Tensor clientCommGPUParams_;
   Tensor clientCommGPUGrads_;
 
-  bool commBufferSynchronized_{true};
+  std::atomic<bool> commBufferSynchronized_{false};
   std::mutex mutexCommBufferSynchronized_;
   std::condition_variable cvCommBufferSynchronized_;
 
@@ -1146,7 +1147,7 @@ private:
     serverShardGrads_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
     // Allocate memory on the first GPU for this shard's params and grads
     size_t size = nodeShardSizes_[mpi_my_rank_];
-    gpuBufferParams_ = newTensor(size, devices_[0]);
+    gpuBufferParams_ = newTensor(size, devices_[0]); // @TODO: Use CUDA UVA (e.g. via cudaMallocHost)?
     gpuBufferGrads_ = newTensor(size, devices_[0]);
     // Initialize server shard optimizer
     serverShardOpt_ = Optimizer(options_); // @TODO: Move to constructor?
@@ -1175,7 +1176,7 @@ private:
         // Update server shard parameters with received gradients @TODO: Consider using GPU instead of CPU for this?
         {
           std::lock_guard<std::mutex> serverShardOptGuard(mutexServerShardOpt_);
-          std::lock_guard<std::mutex> gpuBufferGuard(mutexCommBufferSynchronized_); // @TODO: These mutexes can probably be combined
+          std::lock_guard<std::mutex> gpuBufferGuard(mutexGpuBuffer_); // @TODO: These mutexes can probably be combined
 
           // Copy grads to GPU
           cudaMemcpy(gpuBufferGrads_->data(), serverShardGrads_->data(), bytesToExchange, cudaMemcpyHostToDevice);
@@ -1212,6 +1213,7 @@ private:
 
         // Indicate that new values can be copied to communication buffer
         commBufferSynchronized_ = false;
+        cvCommBufferSynchronized_.notify_one();
 
       } while (true/*@TODO: Add stop condition*/);
     });
@@ -1227,7 +1229,7 @@ private:
       // If server shard is on this node, update locally, else communicate with appropriate node
       if (node == mpi_my_rank_) {
         std::lock_guard<std::mutex> serverShardOptGuard(mutexServerShardOpt_);
-        std::lock_guard<std::mutex> gpuBufferGuard(mutexCommBufferSynchronized_); // @TODO: These mutexes can probably be combined
+        std::lock_guard<std::mutex> gpuBufferGuard(mutexGpuBuffer_); // @TODO: These mutexes can probably be combined
 
         // Copy grads to GPU
         size_t bytesToExchange = nodeShardSizes_[mpi_my_rank_] * sizeof(float);
@@ -1315,8 +1317,7 @@ private:
       if(drop_rate_ && t > 0)
         sparseFetchParams(graph->params()->vals(), my_id);
       else
-        fetchParams(graph->params()->vals(),
-                    params_[nodeGlobalVersionNumber_[my_id] % history_size_]);
+        fetchParams(graph->params()->vals(), params_[nodeGlobalVersionNumber_[my_id] % history_size_]);
 
       graph->forward();
       float cost = costNode->scalar();
@@ -1384,12 +1385,16 @@ private:
 
             // Copy grads from GPU to comm buffer
             cudaMemcpy(&clientCommBufferGrads_->at(offset), params->grads()->data(), bytesToExchange, cudaMemcpyDeviceToHost);
-            // Copy params from comm buffer to GPU
-            cudaMemcpy(params->vals()->data(), &clientCommBufferParams_->at(offset), bytesToExchange, cudaMemcpyHostToDevice);
-            cudaDeviceSynchronize();
+            // Copy params from comm buffer to GPU (except in first run)
+            if (true/*@TODO: Only if not first time syncing*/) {
+              cudaMemcpy(params->vals()->data(), &clientCommBufferParams_->at(offset), bytesToExchange, cudaMemcpyHostToDevice);
+            }
+            cudaDeviceSynchronize(); // @TODO: Maybe better to not use barrier so we can copy in parallel?
 
             offset += size;
           }
+          commBufferSynchronized_ = true;
+          cvCommBufferSynchronized_.notify_one();
         }
       }
     };
