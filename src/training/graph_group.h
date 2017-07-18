@@ -1409,8 +1409,8 @@ private:
               std::lock_guard<std::mutex> guard(mutexLocalSummedGrads_);
               // Copy running sum of grads from GPU to comm buffer
               cudaMemcpy(&clientCommBufferGrads_->at(offset), localSummedGrads_->subtensor(offset, size)->data(), bytesToExchange, cudaMemcpyDeviceToHost);
-              // Add summed grads to params
-              Element(_1 = _1 + _2, params, localSummedGrads_->subtensor(offset, size));
+              // Apply summed grads to params
+              shardOpt_[device]->update(params, localSummedGrads_->subtensor(offset, size));
               cudaDeviceSynchronize(); // sync memcopy
               // Clear summed grads
               Element(_1 = 0, localSummedGrads_->subtensor(offset, size)); // @TODO: Double check
