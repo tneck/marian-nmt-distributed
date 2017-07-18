@@ -817,14 +817,16 @@ private:
   Ptr<std::vector<float>> clientCommBufferParams_;
   Ptr<std::vector<float>> clientCommBufferGrads_; // @TODO: Make one of these per local shard?
 
-  Tensor clientCommGPUParams_;
-  Tensor clientCommGPUGrads_;
-
   std::atomic<bool> commBufferSynchronized_{false};
   std::mutex mutexCommBufferSynchronized_;
   std::condition_variable cvCommBufferSynchronized_;
 
   size_t * nodeShardSizes_; // @TODO: Clear dynamic variable in destructor
+
+  // Additional compute (local) variables
+
+  Tensor localSummedGrads_;
+  std::mutex mutexLocalSummedGrads_;
 
   /*
    *
@@ -1147,7 +1149,7 @@ private:
     serverShardGrads_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
     // Allocate memory on the first GPU for this shard's params and grads
     size_t size = nodeShardSizes_[mpi_my_rank_];
-    gpuBufferParams_ = newTensor(size, devices_[0]); // @TODO: Use CUDA UVA (e.g. via cudaMallocHost)?
+    gpuBufferParams_ = newTensor(size, devices_[0]); // @TODO: Use CUDA UVA (e.g. via cudaMallocHost)? + Distribute over GPUs?
     gpuBufferGrads_ = newTensor(size, devices_[0]);
     // Initialize server shard optimizer
     serverShardOpt_ = Optimizer(options_); // @TODO: Move to constructor?
@@ -1158,6 +1160,8 @@ private:
     size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
     clientCommBufferParams_ = Ptr<std::vector<float>>(new std::vector<float>(totalParamsGradsSize));
     clientCommBufferGrads_ = Ptr<std::vector<float>>(new std::vector<float>(totalParamsGradsSize));
+    localSummedGrads_ = newTensor(totalParamsGradsSize, devices_[0]);
+    Element(_1 = 0, localSummedGrads_); // @TODO: Double check
     // Allocate memory on the first GPU for the buffer's params and grads
     //size_t size = nodeShardSizes_[mpi_my_rank_];
     //clientCommGPUParams_ = newTensor(size, devices_[0]);
@@ -1173,7 +1177,7 @@ private:
         // Receive grads from any client
         MPI_Recv(serverShardGrads_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
 
-        // Update server shard parameters with received gradients @TODO: Consider using GPU instead of CPU for this?
+        // Update server shard params with received grads @TODO: Consider using CPU instead of GPU for this?
         {
           std::lock_guard<std::mutex> serverShardOptGuard(mutexServerShardOpt_);
           std::lock_guard<std::mutex> gpuBufferGuard(mutexGpuBuffer_); // @TODO: These mutexes can probably be combined
@@ -1202,7 +1206,7 @@ private:
     #if MPI_FOUND
     clientCommThread_ = std::thread( [this] {
       do {
-        // Wait for graph params/grads to be copied to buffer
+        // Wait for graph grads to be copied to buffer
         std::unique_lock<std::mutex> lock(mutexCommBufferSynchronized_);
         while (!commBufferSynchronized_) {
           cvCommBufferSynchronized_.wait(lock);
@@ -1213,7 +1217,6 @@ private:
 
         // Indicate that new values can be copied to communication buffer
         commBufferSynchronized_ = false;
-        cvCommBufferSynchronized_.notify_one();
 
       } while (true/*@TODO: Add stop condition*/);
     });
@@ -1226,23 +1229,24 @@ private:
     for (int node = 0; node < mpi_comm_world_size_; node++) {
       size_t size = nodeShardSizes_[node];
 
-      // If server shard is on this node, update locally, else communicate with appropriate node
+      // If server shard is on this node, update locally
       if (node == mpi_my_rank_) {
         std::lock_guard<std::mutex> serverShardOptGuard(mutexServerShardOpt_);
         std::lock_guard<std::mutex> gpuBufferGuard(mutexGpuBuffer_); // @TODO: These mutexes can probably be combined
 
         // Copy grads to GPU
-        size_t bytesToExchange = nodeShardSizes_[mpi_my_rank_] * sizeof(float);
+        size_t bytesToExchange = nodeShardSizes_[mpi_my_rank_] * sizeof(float); // @TODO: Move to top for efficiency?
         cudaMemcpy(gpuBufferGrads_->data(), &newGrads->at(offset), bytesToExchange, cudaMemcpyHostToDevice);
         cudaDeviceSynchronize();
 
         // Run optimizer on GPU
-        serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_);
+        serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_); // @TODO: Only run optimizer for size of shard, not full buffer!!
 
         // Copy params from GPU
         cudaMemcpy(&oldParams->at(offset), gpuBufferParams_->data(), bytesToExchange, cudaMemcpyDeviceToHost);
         cudaDeviceSynchronize();
 
+      // Else communicate with appropriate node
       } else {
         MPI_Send(&newGrads->at(offset), size, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
         MPI_Recv(&oldParams->at(offset), size, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1368,35 +1372,59 @@ private:
           }
         }*/
       }
+
       /*
-       * Node distribution
+       * Node distribution @TODO: Do separately per GPU
        */
+
+      // Update running sum of gradients
+      {
+        std::lock_guard<std::mutex> guard(mutexLocalSummedGrads_);
+        Element(_1 = _1 + _2, localSummedGrads_, graph->params()->grads()); // Add GPU grads to node-local summed grads
+      }
+
+      // If communicator waiting, exchange GPUs' grads/params with communication buffers
       {
         std::unique_lock<std::mutex> lock(mutexCommBufferSynchronized_, std::try_to_lock);
-        // If communicator waiting, exchange grads/params with GPUs communication buffers
-        if(lock.owns_lock()) {
+
+        if(lock.owns_lock() && !commBufferSynchronized_) {
           size_t offset = 0;
           for (int device = 0; device < devices_.size(); device++) {
             std::lock_guard<std::mutex> guard(shardSync_[device]);
 
-            Ptr<Parameters> & params = graphs_[device]->params();
-            size_t size = params->vals()->size();
+            cudaSetDevice(devices_[device]);
+            int version = nodeGlobalVersionNumber_[device] % history_size_;
+            Tensor params = params_[version][device]; // @TODO: Double check
+            size_t size = params->size();
             size_t bytesToExchange = size * sizeof(float);
 
-            // Copy grads from GPU to comm buffer
-            cudaMemcpy(&clientCommBufferGrads_->at(offset), params->grads()->data(), bytesToExchange, cudaMemcpyDeviceToHost);
             // Copy params from comm buffer to GPU (except in first run)
             if (true/*@TODO: Only if not first time syncing*/) {
-              cudaMemcpy(params->vals()->data(), &clientCommBufferParams_->at(offset), bytesToExchange, cudaMemcpyHostToDevice);
+              cudaMemcpy(params->data(), &clientCommBufferParams_->at(offset), bytesToExchange, cudaMemcpyHostToDevice);
+              cudaDeviceSynchronize();
             }
-            cudaDeviceSynchronize(); // @TODO: Maybe better to not use barrier so we can copy in parallel?
+
+            // Apply locally summed grads to copied params, send summed grads to comm buffer and clear them locally
+            {
+              std::lock_guard<std::mutex> guard(mutexLocalSummedGrads_);
+              // Copy running sum of grads from GPU to comm buffer
+              cudaMemcpy(&clientCommBufferGrads_->at(offset), localSummedGrads_->subtensor(offset, size)->data(), bytesToExchange, cudaMemcpyDeviceToHost);
+              // Add summed grads to params
+              Element(_1 = _1 + _2, params, localSummedGrads_->subtensor(offset, size));
+              cudaDeviceSynchronize(); // sync memcopy
+              // Clear summed grads
+              Element(_1 = 0, localSummedGrads_->subtensor(offset, size)); // @TODO: Double check
+            }
 
             offset += size;
           }
+
+          cudaDeviceSynchronize();
           commBufferSynchronized_ = true;
           cvCommBufferSynchronized_.notify_one();
         }
       }
+
     };
 
     pool_.enqueue(task, batch);
