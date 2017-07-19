@@ -818,8 +818,10 @@ private:
   Ptr<std::vector<float>> clientCommBufferGrads_; // @TODO: Make one of these per local shard?
 
   std::vector<bool> commBuffersSynchronized_;
-  std::mutex mutexCommBufferSynchronized_;
-  std::condition_variable cvCommBufferSynchronized_;
+  boost::shared_mutex mutexCommBufferSynchronized_;
+  boost::condition_variable_any cvCommBufferSynchronized_;
+
+  Ptr<OptimizerBase> basicSgdOptimizer_;
 
   size_t * nodeShardSizes_; // @TODO: Clear dynamic variable in destructor
 
@@ -1210,9 +1212,9 @@ private:
     clientCommThread_ = std::thread( [this] {
       do {
         // Wait for graph grads to be copied to buffer
-        std::unique_lock<std::mutex> lock(mutexCommBufferSynchronized_);
+        boost::unique_lock<boost::shared_mutex> unique_lock(mutexCommBufferSynchronized_);
         while (!std::all_of(commBuffersSynchronized_.begin(), commBuffersSynchronized_.end(), [](bool v) { return v; })) { // while not all true
-          cvCommBufferSynchronized_.wait(lock);
+          cvCommBufferSynchronized_.wait(unique_lock);
         }
 
         // Push grads to server shards and receive new params in buffer
@@ -1382,15 +1384,15 @@ private:
 
       // Update running sum of gradients
       {
-        std::lock_guard<std::mutex> guard(shardSync_[my_id]);
+        std::lock_guard<std::mutex> guard(shardSync_[my_id]); // @TODO: IMPORTANT, LOOK INTO THIS (ALSO BELOW) - Not necessary because only grads?
         Element(_1 = _1 + _2, localSummedGrads_[my_id], grads_[my_id]); // Add GPU grads to node-local GPU summed grads @TODO: Put GPU in name somewhere
       }
 
       // If communicator waiting, exchange GPU shard's grads/params with communication buffers
       {
-        std::unique_lock<std::mutex> lock(mutexCommBufferSynchronized_, std::try_to_lock); // @TODO: Use separate lock so both GPUs can run this simultaneously
+        boost::shared_lock<boost::shared_mutex> sharedLock(mutexCommBufferSynchronized_, boost::try_to_lock); // shared lock to allow multiple "readers"
 
-        if(lock.owns_lock() && !commBuffersSynchronized_[my_id]) {
+        if(sharedLock.owns_lock() && !commBuffersSynchronized_[my_id]) {
           std::lock_guard<std::mutex> guard(shardSync_[my_id]); // To prevent other threads from accessing GPU shard's params/grads
 
           Tensor gpuShardParams = params_[nodeGlobalVersionNumber_[my_id] % history_size_][my_id]; // @TODO: Double check
@@ -1408,7 +1410,7 @@ private:
             // Copy running sum of grads from GPU shard to comm buffer
             cudaMemcpy(&clientCommBufferGrads_->at(offset), gpuShardSummedGrads->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
             // Apply summed grads to params
-            shardOpt_[my_id]->update(gpuShardParams, gpuShardSummedGrads);
+            basicSgdOptimizer_->update(gpuShardParams, gpuShardSummedGrads);
             cudaDeviceSynchronize(); // sync memcopy
             // Clear summed grads
             Element(_1 = 0, gpuShardSummedGrads); // @TODO: Double check
@@ -1434,7 +1436,8 @@ public:
         shardSync_{devices_.size()},
         movingAvg_{options_->get<bool>("moving-average")},
         mvDecay_{(float)options_->get<double>("moving-decay")},
-        drop_rate_{options_->get<double>("drop-rate")} {
+        drop_rate_{options_->get<double>("drop-rate")},
+        basicSgdOptimizer_{Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1))} {
     if(drop_rate_ > 0.0) {
       history_size_ = devices_.size() * 1.5;
     }
