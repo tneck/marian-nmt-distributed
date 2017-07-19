@@ -13,11 +13,11 @@ int main(int argc, char** argv) {
   auto options = New<Config>(argc, argv);
   auto devices = options->get<std::vector<size_t>>("devices");
 
-  bool mpiEnabled = true; // @TODO: Load from options
   int comm_world_size = 0;
   bool suitable_thread_mode = false;
 
   #if MPI_FOUND
+  bool mpiEnabled = true; // @TODO: Load from options
   if (mpiEnabled) {
     int provided_thread_mode = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_mode);
@@ -28,8 +28,8 @@ int main(int argc, char** argv) {
 
   if (comm_world_size > 1) {
     if (suitable_thread_mode) {
-      LOG(info)->info("Launching Node Distributed Asynchronous Graph Group");
-      WrapModelType<Train, NodeDistAsyncGraphGroup>(options)->run();
+      LOG(info)->info("Launching Multi-Node Asynchronous Graph Group");
+      WrapModelType<Train, MultiNodeAsyncGraphGroup>(options)->run();
     } else {
       LOG(info)->info("ERROR: No suitable MPI thread mode found. Required: MPI_THREAD_MULTIPLE. Please configure your MPI implementation appropriately. Aborting.");
     }

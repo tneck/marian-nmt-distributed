@@ -712,7 +712,7 @@ public:
 
 // @TODO: Rename to MultiNodeAsyncGraphGroup?
 template <class Builder>
-class NodeDistAsyncGraphGroup : public GraphGroup {
+class MultiNodeAsyncGraphGroup : public GraphGroup {
 public:
   typedef Builder builder_type;
   typedef typename Builder::dataset_type dataset_type;
@@ -1427,7 +1427,7 @@ private:
 
 public:
   template <class... Args>
-  NodeDistAsyncGraphGroup(Ptr<Config> options, Args... args)
+  MultiNodeAsyncGraphGroup(Ptr<Config> options, Args... args)
       : GraphGroup(options),
         devices_{options_->get<std::vector<size_t>>("devices")},
         pool_{devices_.size(), devices_.size()},
