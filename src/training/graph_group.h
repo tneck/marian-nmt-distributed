@@ -803,7 +803,7 @@ private:
   Ptr<std::vector<float>> serverShardGrads_;
 
   Ptr<OptimizerBase> serverShardOpt_; // @TODO: Could also use optimizer from GraphGroup
-  std::mutex mutexServerShardOpt_;
+  std::mutex mutexServerShard_;
 
   // Used both in server thread and client communication thread
   Tensor gpuBufferParams_;
@@ -827,7 +827,7 @@ private:
 
   // Additional compute (local) variables
 
-  std::vector<Tensor> localSummedGrads_;
+  std::vector<Tensor> localGPUSummedGrads_;
 
   /*
    *
@@ -847,7 +847,6 @@ private:
   }
 
   void fetchParams(Tensor oldParams, const std::vector<Tensor>& params) {
-    // @TODO read guard on parameters
     int pos = 0;
 
     std::vector<std::thread> threads;
@@ -911,7 +910,6 @@ private:
     if(graphs_.size() < 2)
       return;
 
-    // @TODO read guard on parameters
     int p = 0;
 
     std::vector<std::thread> threads;
@@ -1081,8 +1079,9 @@ private:
 
         // For node distribution: local running sum of gradients per GPU
         Tensor runningSumGrads = newTensor(__size__, device);
-        Element(_1 = 0, runningSumGrads ); // Initialize each sum to 0 @TODO: Double check
-        localSummedGrads_.push_back(runningSumGrads);
+        Element(_1 = 0, runningSumGrads ); // Initialize each sum to 0
+        cudaStreamSynchronize(0);
+        localGPUSummedGrads_.push_back(runningSumGrads);
       }
       commBuffersSynchronized_ = std::vector<bool>(devices_.size(), false); // @TODO: Move to constructor
     }
@@ -1156,7 +1155,7 @@ private:
     serverShardGrads_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
     // Allocate memory on the first GPU for this shard's params and grads
     size_t size = nodeShardSizes_[mpi_my_rank_];
-    gpuBufferParams_ = newTensor(size, devices_[0]); // @TODO: Use CUDA UVA (e.g. via cudaMallocHost)? + Distribute over GPUs?
+    gpuBufferParams_ = newTensor(size, devices_[0]);
     gpuBufferGrads_ = newTensor(size, devices_[0]);
     // Initialize server shard optimizer
     serverShardOpt_ = Optimizer(options_); // @TODO: Move to constructor?
@@ -1182,21 +1181,20 @@ private:
         // Receive grads from any client
         MPI_Recv(serverShardGrads_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
 
-        // Update server shard params with received grads @TODO: Consider using CPU instead of GPU for this?
+        // Update server shard params with received grads
         {
-          std::lock_guard<std::mutex> serverShardOptGuard(mutexServerShardOpt_);
-          std::lock_guard<std::mutex> gpuBufferGuard(mutexGpuBuffer_); // @TODO: These mutexes can probably be combined
+          std::lock_guard<std::mutex> guard(mutexServerShard_);
 
           // Copy grads to GPU
           cudaMemcpy(gpuBufferGrads_->data(), serverShardGrads_->data(), bytesToExchange, cudaMemcpyHostToDevice);
-          cudaDeviceSynchronize();
+          cudaStreamSynchronize(0);
 
           // Run optimizer on GPU
           serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_);
 
           // Copy params from GPU
           cudaMemcpy(serverShardParams_->data(), gpuBufferParams_->data(), bytesToExchange, cudaMemcpyDeviceToHost);
-          cudaDeviceSynchronize();
+          cudaStreamSynchronize(0);
         }
 
         // Push updated params to same client
@@ -1236,20 +1234,19 @@ private:
 
       // If server shard is on this node, update locally
       if (node == mpi_my_rank_) {
-        std::lock_guard<std::mutex> serverShardOptGuard(mutexServerShardOpt_);
-        std::lock_guard<std::mutex> gpuBufferGuard(mutexGpuBuffer_); // @TODO: These mutexes can probably be combined
+        std::lock_guard<std::mutex> guard(mutexServerShard_);
 
         // Copy grads to GPU
-        size_t bytesToExchange = nodeShardSizes_[mpi_my_rank_] * sizeof(float); // @TODO: Move to top for efficiency?
-        cudaMemcpy(gpuBufferGrads_->data(), &newGrads->at(offset), bytesToExchange, cudaMemcpyHostToDevice);
-        cudaDeviceSynchronize();
+        cudaMemcpy(gpuBufferGrads_->data(), &newGrads->at(offset), size * sizeof(float), cudaMemcpyHostToDevice);
+        cudaStreamSynchronize(0);
 
         // Run optimizer on GPU
-        serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_); // @TODO: Only run optimizer for size of shard, not full buffer!!
+        serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_);
+        cudaStreamSynchronize(0);
 
         // Copy params from GPU
-        cudaMemcpy(&oldParams->at(offset), gpuBufferParams_->data(), bytesToExchange, cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
+        cudaMemcpy(&oldParams->at(offset), gpuBufferParams_->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaStreamSynchronize(0);
 
       // Else communicate with appropriate node
       } else {
@@ -1258,7 +1255,7 @@ private:
       }
 
       offset += size;
-    } // @TODO: Consider probing and synchronizing with available shard instead of using strict order
+    }
     #endif
   }
 
@@ -1362,20 +1359,6 @@ private:
             fetchParams(graph->params()->vals(), paramsAvg_);
           scheduler_->validate(graph);
         }
-
-        /*if(movingAvg_) {
-          size_t injectFreq = options_->get<size_t>("moving-inject-freq");
-          if(injectFreq && scheduler_->numberOfBatches() % injectFreq == 0) {
-            boost::upgrade_to_unique_lock<boost::shared_mutex> uniqueLock(lock);
-
-            LOG(info)->info("{} : Injecting moving average into training parameters",
-                            scheduler_->numberOfBatches());
-            for(int idx = 0; idx < paramsAvg_.size(); idx++) {
-              std::lock_guard<std::mutex> guard(shardSync_[idx]);
-              params_[my_id][idx]->copyFrom(paramsAvg_[idx]);
-            }
-          }
-        }*/
       }
 
       /*
@@ -1385,8 +1368,8 @@ private:
       // Update running sum of gradients
       {
         std::lock_guard<std::mutex> guard(shardSync_[my_id]);
-        Element(_1 = _1 + _2, localSummedGrads_[my_id], grads_[my_id]); // Add GPU grads to node-local GPU summed grads @TODO: Put GPU shard in name somewhere
-        cudaDeviceSynchronize();
+        Element(_1 = _1 + _2, localGPUSummedGrads_[my_id], grads_[my_id]); // Add GPU grads to node-local GPU summed grads
+        cudaStreamSynchronize(0);
       }
 
       // If communicator waiting, exchange GPU shard's grads/params with communication buffers
@@ -1396,28 +1379,26 @@ private:
         if(sharedLock.owns_lock()) {
           std::lock_guard<std::mutex> guard(shardSync_[my_id]); // To prevent other threads from accessing GPU shard's params/grads
 
-          Tensor gpuShardParams = params_[nodeGlobalVersionNumber_[my_id] % history_size_][my_id]; // @TODO: Double check
-          Tensor gpuShardSummedGrads = localSummedGrads_[my_id];
+          Tensor gpuShardParams = params_[0/*nodeGlobalVersionNumber_[my_id] % history_size_*/][my_id];
+          Tensor gpuShardSummedGrads = localGPUSummedGrads_[my_id];
           size_t size = gpuShardParams->size();
-          size_t offset = my_id * localSummedGrads_[0]->size();
+          size_t offset = my_id * localGPUSummedGrads_[0]->size();
 
           // Copy params from comm buffer to GPU shard(except in first run)
           if (true/*@TODO: Only if not first time syncing*/) {
             cudaMemcpy(gpuShardParams->data(), &clientCommBufferParams_->at(offset), size * sizeof(float), cudaMemcpyHostToDevice);
-            cudaDeviceSynchronize();
+            cudaStreamSynchronize(0);
           }
 
-          {
-            // Copy running sum of grads from GPU shard to comm buffer
-            cudaMemcpy(&clientCommBufferGrads_->at(offset), gpuShardSummedGrads->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
-            // Apply summed grads to params
-            basicSgdOptimizer_->update(gpuShardParams, gpuShardSummedGrads);
-            cudaDeviceSynchronize(); // sync memcopy
-            // Clear summed grads
-            Element(_1 = 0, gpuShardSummedGrads); // @TODO: Double check
-          }
+          // Copy running sum of grads from GPU shard to comm buffer
+          cudaMemcpy(&clientCommBufferGrads_->at(offset), gpuShardSummedGrads->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
+          // Apply summed grads to params
+          basicSgdOptimizer_->update(gpuShardParams, gpuShardSummedGrads);
+          cudaStreamSynchronize(0); // sync memcopy
+          // Clear summed grads
+          Element(_1 = 0, gpuShardSummedGrads); // @TODO: Double check
+          cudaStreamSynchronize(0);
 
-          cudaDeviceSynchronize();
           commBuffersSynchronized_[my_id] = true;
           cvCommBufferSynchronized_.notify_one();
         }
