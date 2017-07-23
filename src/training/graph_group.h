@@ -745,21 +745,7 @@ private:
 
   boost::shared_mutex schedulerMutex_;
 
-  std::vector<SparseTensor> localSparseGrads_;
-  std::vector<SparseTensor> sparseGrads_;
-  std::vector<SparseTensor> tmpSparseDelta_;
-  std::vector<std::vector<SparseTensor>> localSparseDelta_;
-
-  // version number per-shard
-  std::vector<int> nodeGlobalVersionNumber_;
-
-  // each worker has the version number obtained from each shard
-  std::vector<std::vector<int>> localVersionNumbers_;
-
-  std::vector<std::vector<GradientDrop>> fetchDropper_;
-  std::vector<Tensor> tmpTensor_;
-
-  std::vector<std::vector<Tensor>> params_;
+  std::vector<Tensor> params_;
   std::vector<Ptr<TensorAllocator>> paramsAlloc_;
 
   std::vector<Tensor> grads_;
@@ -768,7 +754,6 @@ private:
   std::vector<Ptr<OptimizerBase>> shardOpt_;
 
   int gpuShardSize_;
-  int tau_{1};
 
   std::vector<Tensor> paramsAvg_;
   std::vector<Ptr<TensorAllocator>> paramsAllocAvg_;
@@ -776,9 +761,6 @@ private:
   float mvDecay_{0.9999};
 
   ThreadPool pool_;
-
-  double drop_rate_{0};
-  int history_size_{1};
 
   /*
    *
@@ -880,19 +862,10 @@ private:
             grads_[idx]->copyFrom(
                 newGrads->subtensor(pos, grads_[idx]->size()));
 
-            // apply and increment your version number, if history is enabled
-            int latestVersion = 0;
-
-            if(history_size_ > 1) {
-              int pastVersion = nodeGlobalVersionNumber_[idx] % history_size_;
-              latestVersion = ++nodeGlobalVersionNumber_[idx] % history_size_;
-              params_[latestVersion][idx]->copyFrom(params_[pastVersion][idx]);
-            }
-
-            shardOpt_[idx]->update(params_[latestVersion][idx], grads_[idx]);
+            shardOpt_[idx]->update(params_[idx], grads_[idx]);
 
             if(movingAvg_)
-              updateMovingAverage(paramsAvg_[idx], params_[latestVersion][idx],
+              updateMovingAverage(paramsAvg_[idx], params_[idx],
                                   scheduler_->numberOfBatches());
 
             cudaStreamSynchronize(0);
@@ -904,115 +877,6 @@ private:
     }
     for(auto&& t : threads)
       t.join();
-  }
-
-  void sparseFetchParams(Tensor oldParams, int worker_id) {
-    if(graphs_.size() < 2)
-      return;
-
-    int p = 0;
-
-    std::vector<std::thread> threads;
-    for(int i = 0; i < devices_.size(); i++) {
-      threads.emplace_back(std::thread(
-          [=](int idx, int pos) {
-            // individual mutex per-shard
-            std::lock_guard<std::mutex> guard(shardSync_[idx]);
-            // obtain the delta
-            int latestVersion = nodeGlobalVersionNumber_[idx] % history_size_;
-            int currVersion
-                = localVersionNumbers_[worker_id][idx] % history_size_;
-
-            // check if the current version is too old
-            if(nodeGlobalVersionNumber_[idx] - localVersionNumbers_[worker_id][idx]
-               >= history_size_)
-              currVersion = (1 + nodeGlobalVersionNumber_[idx])
-                            % history_size_;  // if so, pick the best you can do
-
-            // if already latest
-            if(nodeGlobalVersionNumber_[idx] == localVersionNumbers_[worker_id][idx])
-              return;
-
-            // get delta : param latest version - current param (locally)
-            Element(_1 = _2 - _3,
-                    tmpTensor_[idx],
-                    params_[latestVersion][idx],
-                    params_[currVersion][idx]);
-            cudaStreamSynchronize(0);
-
-            // get sparse delta
-            fetchDropper_[worker_id][idx]->dropGraph(
-                tmpTensor_[idx], tmpSparseDelta_[idx], drop_rate_);
-            cudaStreamSynchronize(0);
-
-            // move sparse delta
-            localSparseDelta_[worker_id][idx]->copyFrom(tmpSparseDelta_[idx]);
-            cudaStreamSynchronize(0);
-
-            localSparseDelta_[worker_id][idx]->scatterAdd(
-                oldParams->subtensor(pos, grads_[idx]->size()));
-            cudaStreamSynchronize(0);
-
-            localVersionNumbers_[worker_id][idx] = nodeGlobalVersionNumber_[idx];
-
-          },
-          i,
-          p));
-
-      p += gpuShardSize_;
-    }
-    for(auto&& t : threads) {
-      t.join();
-    }
-  }
-
-  void sparsePush(SparseTensor newGrads) {
-    if(graphs_.size() < 2) {
-      opt_->update(graphs_[0]);
-    } else {
-      // add instead of copy?
-      std::vector<std::thread> threads;
-      int pos = 0;
-      for(int idx = 0; idx < devices_.size(); idx++) {
-        threads.emplace_back(std::thread(
-            [=](int idx, int pos) {
-              // individual mutex per-shard
-              std::lock_guard<std::mutex> guard(shardSync_[idx]);
-
-              // split to shard
-              SparseTensor subGrad
-                  = newGrads->subtensor(pos, grads_[idx]->size(), idx);
-              cudaStreamSynchronize(0);
-
-              // sent
-              sparseGrads_[idx]->copyFrom(subGrad);
-              cudaStreamSynchronize(0);
-
-              // convert back to dense, with index offset of -pos
-              sparseGrads_[idx]->toDense(grads_[idx], -pos);
-              cudaStreamSynchronize(0);
-
-              // apply and increment your version number
-              int pastVersion = nodeGlobalVersionNumber_[idx] % history_size_;
-              int latestVersion = ++nodeGlobalVersionNumber_[idx] % history_size_;
-              params_[latestVersion][idx]->copyFrom(params_[pastVersion][idx]);
-              shardOpt_[idx]->update(params_[latestVersion][idx], grads_[idx]);
-
-              if(movingAvg_)
-                updateMovingAverage(paramsAvg_[idx],
-                                    params_[latestVersion][idx],
-                                    scheduler_->numberOfBatches());
-
-              cudaStreamSynchronize(0);
-            },
-            idx,
-            pos));
-
-        pos += gpuShardSize_;
-      }
-      for(auto&& t : threads)
-        t.join();
-    }
   }
 
   void updateMovingAverage(Tensor paramsAvg, Tensor params, size_t batches) {
@@ -1027,16 +891,9 @@ private:
       // takes care of thead_local stuff
       THREAD_GUARD(builders_[i]->build(graphs_[i], batch);
                        graphs_[i]->forward(););
-
-      nodeGlobalVersionNumber_.push_back(0);
-      std::vector<int> localVersion;
-      for(int j = 0; j < graphs_.size(); j++)
-        localVersion.push_back(0);
-
-      localVersionNumbers_.push_back(localVersion);
     }
 
-    if(params_[0].size() == 0) {
+    if(params_.size() == 0) {
       int totalSize = graphs_[0]->params()->vals()->size();
       gpuShardSize_ = ceil(totalSize / devices_.size());
 
@@ -1046,20 +903,15 @@ private:
         int __size__ = min(gpuShardSize_, totalSize);
         totalSize -= __size__;
 
-        for(int h_id = 0; h_id < history_size_; h_id++) {
-          Tensor param;
-          Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
-          allocator->reserveExact(__size__);
-          allocator->allocate(param, {1, __size__});
-          paramsAlloc_.push_back(allocator);
+        Tensor param;
+        Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
+        allocator->reserveExact(__size__);
+        allocator->allocate(param, {1, __size__});
+        paramsAlloc_.push_back(allocator);
 
-          param->copyFrom(
-              graphs_[0]->params()->vals()->subtensor(pos, __size__));
-          params_[h_id].push_back(param);
-        }
+        param->copyFrom(graphs_[0]->params()->vals()->subtensor(pos, __size__));
+        params_.push_back(param);
 
-        if(drop_rate_)
-          tmpTensor_.push_back(newTensor(__size__, device));
         pos += __size__;
       }
     }
@@ -1099,7 +951,7 @@ private:
           allocator->reserveExact(__size__);
           allocator->allocate(paramAvg, {1, __size__});
 
-          paramAvg->copyFrom(params_[0][i++]);
+          paramAvg->copyFrom(params_[i++]);
 
           paramsAllocAvg_.push_back(allocator);
           paramsAvg_.push_back(paramAvg);
@@ -1107,23 +959,6 @@ private:
       }
     }
 
-    if(drop_rate_ && first_) {
-      int totalSize = graphs_[0]->params()->vals()->size();
-      int sparseCap = totalSize * 1.2 * (1.0 - drop_rate_);
-      for(auto device : devices_) {
-        sparseGrads_.push_back(
-            SparseTensor(new SparseTensorBase(sparseCap, device)));
-        localSparseGrads_.push_back(
-            SparseTensor(new SparseTensorBase(sparseCap, device)));
-        tmpSparseDelta_.push_back(SparseTensor(
-            new SparseTensorBase(sparseCap / devices_.size(), device)));
-        std::vector<SparseTensor> tmp;
-        for(int i = 0; i < devices_.size(); i++)
-          tmp.push_back(SparseTensor(
-              new SparseTensorBase(sparseCap / devices_.size(), device)));
-        localSparseDelta_.push_back(tmp);
-      }
-    }
   }
 
   /*
@@ -1309,21 +1144,9 @@ private:
         builder = builders_[i++];
       }
 
-      if(!dropper) {
-        std::lock_guard<std::mutex> lock(sync_);
-        dropper = GradientDrop(new GradientDropBase());
-        std::vector<GradientDrop> tmp;
-        for(int i = 0; i < devices_.size(); i++)
-          tmp.push_back(GradientDrop(new GradientDropBase()));
-        fetchDropper_.push_back(tmp);
-      }
-
       auto costNode = builder->build(graph, batch);
 
-      if(drop_rate_ && t > 0)
-        sparseFetchParams(graph->params()->vals(), my_id);
-      else
-        fetchParams(graph->params()->vals(), params_[nodeGlobalVersionNumber_[my_id] % history_size_]);
+      fetchParams(graph->params()->vals(), params_);
 
       graph->forward();
       float cost = costNode->scalar();
@@ -1332,12 +1155,7 @@ private:
       t++;
 
       cudaStreamSynchronize(0);
-      if(drop_rate_) {
-        dropper->dropGraph(
-            graph->params()->grads(), localSparseGrads_[my_id], drop_rate_);
-        sparsePush(localSparseGrads_[my_id]);
-      } else
-        pushGradients(graph->params()->grads());
+      pushGradients(graph->params()->grads());
 
       if(scheduler_) {
         boost::upgrade_lock<boost::shared_mutex> lock(schedulerMutex_);
@@ -1379,7 +1197,7 @@ private:
         if(sharedLock.owns_lock()) {
           std::lock_guard<std::mutex> guard(shardSync_[my_id]); // To prevent other threads from accessing GPU shard's params/grads
 
-          Tensor gpuShardParams = params_[0/*nodeGlobalVersionNumber_[my_id] % history_size_*/][my_id];
+          Tensor gpuShardParams = params_[my_id];
           Tensor gpuShardSummedGrads = localGPUSummedGrads_[my_id];
           size_t size = gpuShardParams->size();
           size_t offset = my_id * localGPUSummedGrads_[0]->size();
@@ -1418,13 +1236,7 @@ public:
         shardSync_{devices_.size()},
         movingAvg_{options_->get<bool>("moving-average")},
         mvDecay_{(float)options_->get<double>("moving-decay")},
-        drop_rate_{options_->get<double>("drop-rate")},
         basicSgdOptimizer_{Optimizer<Sgd>(0.001, keywords::clip=Clipper<Norm>(1))} {
-    if(drop_rate_ > 0.0) {
-      history_size_ = devices_.size() * 1.5;
-    }
-    for(int i = 0; i < history_size_; i++)
-      params_.push_back(std::vector<Tensor>());
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
