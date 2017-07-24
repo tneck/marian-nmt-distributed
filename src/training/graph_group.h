@@ -773,7 +773,6 @@ public:
   }
 };
 
-// @TODO: Rename to MultiNodeAsyncGraphGroup?
 template <class Builder>
 class MultiNodeAsyncGraphGroup : public GraphGroup {
 public:
@@ -813,6 +812,10 @@ private:
   float mvDecay_{0.9999};
 
   ThreadPool pool_;
+
+  std::vector<Ptr<TensorAllocator>> allocators;
+
+  size_t tau_{1};
 
   /*
    *
@@ -890,15 +893,15 @@ private:
    *
    */
 
-  std::vector<Ptr<TensorAllocator>> allocators;
+
   Tensor newTensor(int size, int device) {
-    Tensor T;
+    Tensor t;
     Ptr<TensorAllocator> allocator_ = New<TensorAllocator>(device);
-    allocator_->reserveExact(size);
-    allocator_->allocate(T, {1, size});
+    allocator_->reserveExact(size * sizeof(float));
+    allocator_->allocate(t, {1, size});
     allocators.push_back(allocator_);
 
-    return T;
+    return t;
   }
 
   void updateMovingAverage(Tensor paramsAvg, Tensor params, size_t batches) { // @TODO: Implement?
@@ -1030,7 +1033,7 @@ private:
     #endif
   }
 
-  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams) {
+  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, size_t batchWords) {
     #if MPI_FOUND
 
     // Update remotely
@@ -1052,7 +1055,11 @@ private:
             gpuShardGrads_[gpu]->copyFrom(newGrads->subtensor(offset, size));
             cudaStreamSynchronize(0);
             // Run optimizer on GPU
-            gpuShardOpts_[gpu]->update(gpuShardParams_[0][gpu], gpuShardGrads_[gpu]);
+            if (scale_lr) {
+              gpuShardOpts_[gpu]->update(gpuShardParams_[0][gpu], gpuShardGrads_[gpu], average_batch_words);
+            } else {
+              gpuShardOpts_[gpu]->update(gpuShardParams_[0][gpu], gpuShardGrads_[gpu]);
+            }
             cudaStreamSynchronize(0);
             // Copy params back to current GPU
             oldParams->subtensor(offset, size)->copyFrom(gpuShardParams_[0][gpu]);
@@ -1085,7 +1092,7 @@ private:
     #endif
   }
 
-  void sparseSynchronizeWithServerShards(SparseTensor newGrads, Tensor oldParams, int gpu) {
+  void sparseSynchronizeWithServerShards(SparseTensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
     // @TODO: Implement
   }
 
@@ -1122,6 +1129,10 @@ private:
       thread_local Ptr<ExpressionGraph> graph;
       thread_local Ptr<Builder> builder;
       thread_local size_t t = 0;
+      thread_local size_t numSeenWords = 0;
+
+      thread_local Tensor accGradients;
+      thread_local Ptr<TensorAllocator> accAlloc;
 
       thread_local GradientDrop gradientDropper;
 
@@ -1150,15 +1161,43 @@ private:
       float cost = costNode->scalar();
       graph->backward();
 
+      // Get batch stats
+      size_t batchWords = batch->words();
+
+      Tensor gradients;
+      if (tau_ > 1) {
+        if (t == 0) {
+          accAlloc = New<TensorAllocator>(graph->getDevice());
+          accAlloc->reserveExact(graph->params()->grads()->memory()->size());
+          accAlloc->allocate(accGradients, graph->params()->grads()->shape());
+          accGradients->set(0);
+        }
+
+        Element(_1 += _2, accGradients, graph->params()->grads());
+        gradients = accGradients;
+        numSeenWords += batchWords; // Keep track of how many words we've calculated the error from
+      }
+      else {
+        gradients = graph->params()->grads();
+        numSeenWords = batchWords;
+      }
+
       t++;
 
       cudaStreamSynchronize(0);
 
-      if (dropRate_ && t > 0) {
-        gradientDropper->dropGraph(graph->params()->grads(), localSparseGrads_[my_id], dropRate_);
-        sparseSynchronizeWithServerShards(localSparseGrads_[my_id], graph->params()->vals(), my_id);
-      } else {
-        synchronizeWithServerShards(graph->params()->grads(), graph->params()->vals());
+      if (t % tau_ == 0) {
+        if (dropRate_ && t > 0) {
+          gradientDropper->dropGraph(graph->params()->grads(), localSparseGrads_[my_id], dropRate_);
+          sparseSynchronizeWithServerShards(localSparseGrads_[my_id], graph->params()->vals(), my_id, numSeenWords);
+        } else {
+          synchronizeWithServerShards(graph->params()->grads(), graph->params()->vals(), numSeenWords);
+        }
+        numSeenWords = 0;
+
+        if(tau_ > 1) {
+          gradients->set(0);
+        }
       }
 
       if(scheduler_) {
@@ -1240,9 +1279,10 @@ public:
         mutexGpuShards_{devices_.size()},
         movingAvg_{options_->get<bool>("moving-average")},
         mvDecay_{(float)options_->get<double>("moving-decay")},
+        dropRate_{options_->get<double>("drop-rate")},
         basicSgdOptimizer_{Optimizer<Sgd>(0.001, keywords::clip=Clipper<Norm>(1))} {
     if (dropRate_ > 0.0) {
-      historySize_ = devices_.size() * 1.5;
+      historySize_ = devices_.size(); // devices_.size() * 1.5
     }
     for (int i = 0; i < historySize_; i++) {
       gpuShardParams_.push_back(std::vector<Tensor>());
