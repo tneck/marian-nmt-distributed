@@ -5,7 +5,7 @@
 
 namespace marian {
 void Sgd::updateImpl(Tensor params, Tensor grads) {
-  Element(_1 -= eta_ * _2, params, grads);
+  Element(_1 -= (multiply_factor*eta_) * _2, params, grads);
 }
 
 void Adagrad::updateImpl(Tensor params, Tensor grads) {
@@ -13,15 +13,15 @@ void Adagrad::updateImpl(Tensor params, Tensor grads) {
     alloc_ = New<TensorAllocator>(params->getDevice());
 
   if(!gt_) {
-    int totalSize = params->size();
-    alloc_->reserveExact(totalSize);
-    alloc_->allocate(gt_, {1, totalSize});
+    int elements = params->size();
+    alloc_->reserveExact(params->memory()->size());
+    alloc_->allocate(gt_, {1, elements});
     gt_->set(0);
   }
 
   Element(_1 += (_2 * _2), gt_, grads);
 
-  Element(_1 -= (eta_ / (Sqrt(_2) + eps_)) * _3, params, gt_, grads);
+  Element(_1 -= ((multiply_factor*eta_) / (Sqrt(_2) + eps_)) * _3, params, gt_, grads);
 }
 
 void Adam::updateImpl(Tensor params, Tensor grads) {
@@ -31,13 +31,13 @@ void Adam::updateImpl(Tensor params, Tensor grads) {
     vtAlloc_ = New<TensorAllocator>(params->getDevice());
 
   if(!mt_) {
-    int totalSize = params->size();
-    mtAlloc_->reserveExact(totalSize);
-    mtAlloc_->allocate(mt_, {1, totalSize});
+    int elements = params->size();
+    mtAlloc_->reserveExact(params->memory()->size());
+    mtAlloc_->allocate(mt_, {1, elements});
     mt_->set(0);
 
-    vtAlloc_->reserveExact(totalSize);
-    vtAlloc_->allocate(vt_, {1, totalSize});
+    vtAlloc_->reserveExact(params->memory()->size());
+    vtAlloc_->allocate(vt_, {1, elements});
     vt_->set(0);
   }
 
@@ -48,7 +48,7 @@ void Adam::updateImpl(Tensor params, Tensor grads) {
   Element(_1 = (beta1_ * _1) + ((1 - beta1_) * _2), mt_, grads);
   Element(_1 = (beta2_ * _1) + ((1 - beta2_) * (_2 * _2)), vt_, grads);
 
-  Element(_1 -= eta_ * (_2 / denom1) / (Sqrt(_3 / denom2) + eps_),
+  Element(_1 -= (multiply_factor*eta_) * (_2 / denom1) / (Sqrt(_3 / denom2) + eps_),
           params,
           mt_,
           vt_);
