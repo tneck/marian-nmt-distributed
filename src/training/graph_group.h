@@ -742,7 +742,6 @@ private:
 
   std::mutex sync_;
 
-
   boost::shared_mutex schedulerMutex_;
 
   std::vector<Tensor> paramsAvg_;
@@ -775,7 +774,7 @@ private:
   Ptr<std::vector<float>> serverShardBuffer_; // @TODO: Shared pointer necessary? + Verify auto delete/clear
 
   std::vector<Ptr<OptimizerBase>> gpuShardOpts_; // @TODO: Could also use optimizer from GraphGroup
-  std::vector<Tensor> gpuShardParams_;
+  std::vector<std::vector<Tensor>> gpuShardParams_;
   std::vector<Tensor> gpuShardGrads_;
   std::mutex mutexServerShard_;
 
@@ -799,6 +798,24 @@ private:
 
   size_t * nodeShardSizes_; // @TODO: Clear dynamic variable in destructor
   size_t * gpuShardSizes_; // @TODO: Clear dynamic variable in destructor
+
+  /*
+   * Sparse communication variables (taken over from AsyncGraphGroup)
+   */
+
+  std::vector<SparseTensor> localSparseGrads_;
+  std::vector<SparseTensor> shardSparseGrads_;
+  std::vector<SparseTensor> tmpSparseDeltas_; // @TODO: Find better name
+  std::vector<std::vector<SparseTensor>> localSparseDeltas_;
+
+  int shardGlobalVersionNumber_;
+  std::vector<std::vector<int>> localVersionNumbers_;
+
+  std::vector<std::vector<GradientDrop>> fetchDropper_;
+  std::vector<Tensor> tmpTensor_; // @TODO: Find better name
+
+  double dropRate_{0};
+  int historySize_{1};
 
   // Additional compute (local) variables
 
@@ -869,10 +886,26 @@ private:
     size_t offset = 0;
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
       size_t size = std::min(gpuShardSize, thisNodeSize - offset);
-      auto params = newTensor(size, devices_[gpu]);
-      params->copyFrom(graphs_[0]->params()->vals()->subtensor(offset, size));
-      cudaStreamSynchronize(0);
-      gpuShardParams_.push_back(params);
+      for (int his = 0; his < historySize_; his++) { // for gradient dropping
+        auto params = newTensor(size, devices_[gpu]);
+        params->copyFrom(graphs_[0]->params()->vals()->subtensor(offset, size));
+        cudaStreamSynchronize(0);
+        gpuShardParams_[his].push_back(params);
+      }
+      if (dropRate_) {
+        tmpTensor_.push_back(newTensor(size, devices_[gpu]));
+
+        int sparseCap = totalParamsGradsSize * 1.2 * (1.0 - dropRate_); // @TODO: Does total need to be replaced with node?
+        shardSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu])));
+        localSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu])));
+        tmpSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap / devices_.size(), devices_[gpu])));
+        std::vector<SparseTensor> sparseDeltas;
+        for (int i = 0; i < devices_.size(); i++) { // @TODO: Pretty sure this has to be per node not per GPU
+          sparseDeltas.push_back(SparseTensor(new SparseTensorBase(sparseCap / devices_.size(), devices_[gpu])));
+        }
+        localSparseDeltas_.push_back(sparseDeltas);
+
+      }
       gpuShardGrads_.push_back(newTensor(size, devices_[gpu]));
       //LOG(info)->info("{} assigning gpu {} size {}", mpi_my_rank_, gpu, size);
       gpuShardSizes_[gpu] = size;
@@ -915,10 +948,10 @@ private:
             cudaMemcpy(gpuShardGrads_[gpu]->data(), &serverShardBuffer_->at(offset), size * sizeof(float), cudaMemcpyHostToDevice);
             cudaStreamSynchronize(0);
             // Run optimizer on GPU
-            gpuShardOpts_[gpu]->update(gpuShardParams_[gpu], gpuShardGrads_[gpu]);
+            gpuShardOpts_[gpu]->update(gpuShardParams_[0][gpu], gpuShardGrads_[gpu]);
             cudaStreamSynchronize(0);
             // Copy params from GPU
-            cudaMemcpy(&serverShardBuffer_->at(offset), gpuShardParams_[gpu]->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&serverShardBuffer_->at(offset), gpuShardParams_[0][gpu]->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
             cudaStreamSynchronize(0);
             }, gpu, offset, size));
 
@@ -956,16 +989,15 @@ private:
             gpuShardGrads_[gpu]->copyFrom(newGrads->subtensor(offset, size));
             cudaStreamSynchronize(0);
             // Run optimizer on GPU
-            gpuShardOpts_[gpu]->update(gpuShardParams_[gpu], gpuShardGrads_[gpu]);
+            gpuShardOpts_[gpu]->update(gpuShardParams_[0][gpu], gpuShardGrads_[gpu]);
             cudaStreamSynchronize(0);
             // Copy params back to current GPU
-            oldParams->subtensor(offset, size)->copyFrom(gpuShardParams_[gpu]);
+            oldParams->subtensor(offset, size)->copyFrom(gpuShardParams_[0][gpu]);
             cudaStreamSynchronize(0);
           }, gpu, localOffset, gpuSize));
 
           localOffset += gpuSize;
         }
-
         for (auto && t : threads) { t.join(); }
 
         // Update remotely
@@ -987,8 +1019,11 @@ private:
 
       offset += nodeSize;
     }
-
     #endif
+  }
+
+  void sparseSynchronizeWithServerShards(SparseTensor newGrads, Tensor oldParams, int gpu) {
+    // @TODO: Implement
   }
 
   void shutDownServerShardThread() {
@@ -1025,13 +1060,25 @@ private:
       thread_local Ptr<Builder> builder;
       thread_local size_t t = 0;
 
-      //thread_local size_t my_id = 0;
+      thread_local GradientDrop gradientDropper;
+
+      thread_local size_t my_id = 0;
 
       if(!graph) {
         std::lock_guard<std::mutex> lock(sync_);
-        //my_id = i;
+        my_id = i;
         graph = graphs_[i];
         builder = builders_[i++];
+      }
+
+      if (dropRate_ && !gradientDropper) {
+        std::lock_guard<std::mutex> guard(sync_);
+        gradientDropper = GradientDrop(new GradientDropBase());
+        std::vector<GradientDrop> droppers;
+        for (int i = 0; i < devices_.size(); i++) {
+          droppers.push_back(GradientDrop(new GradientDropBase()));
+        }
+        fetchDropper_.push_back(droppers);
       }
 
       auto costNode = builder->build(graph, batch);
@@ -1044,7 +1091,12 @@ private:
 
       cudaStreamSynchronize(0);
 
-      synchronizeWithServerShards(graph->params()->grads(), graph->params()->vals());
+      if (dropRate_ && t > 0) {
+        gradientDropper->dropGraph(graph->params()->grads(), localSparseGrads_[my_id], dropRate_);
+        sparseSynchronizeWithServerShards(localSparseGrads_[my_id], graph->params()->vals(), my_id);
+      } else {
+        synchronizeWithServerShards(graph->params()->grads(), graph->params()->vals());
+      }
 
       if(scheduler_) {
         boost::upgrade_lock<boost::shared_mutex> lock(schedulerMutex_);
@@ -1126,6 +1178,12 @@ public:
         movingAvg_{options_->get<bool>("moving-average")},
         mvDecay_{(float)options_->get<double>("moving-decay")},
         basicSgdOptimizer_{Optimizer<Sgd>(0.001, keywords::clip=Clipper<Norm>(1))} {
+    if (dropRate_ > 0.0) {
+      historySize_ = devices_.size() * 1.5;
+    }
+    for (int i = 0; i < historySize_; i++) {
+      gpuShardParams_.push_back(std::vector<Tensor>());
+    }
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
