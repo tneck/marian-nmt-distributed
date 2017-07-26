@@ -844,9 +844,9 @@ private:
 
   Ptr<std::vector<float>> serverShardBuffer_; // @TODO: Shared pointer necessary? + Verify auto delete/clear
 
-  std::vector<Ptr<OptimizerBase>> gpuShardOpts_; // @TODO: Could also use optimizer from GraphGroup
-  std::vector<std::vector<Tensor>> gpuShardParams_;
-  std::vector<Tensor> gpuShardGrads_;
+  std::vector<Ptr<OptimizerBase>> gpuShardsOpts_; // @TODO: Could also use optimizer from GraphGroup
+  std::vector<Tensor> gpuShardsParams_;
+  std::vector<Tensor> gpuShardsGrads_;
   std::mutex mutexServerShard_;
 
   std::vector<std::mutex> mutexGpuShards_;
@@ -880,10 +880,12 @@ private:
   Ptr<std::vector<float>> clientShardSparseBuffer1_;
   Ptr<std::vector<float>> clientShardSparseBuffer2_;
 
+  std::vector<std::vector<std::vector<Tensor>>> clientsParams_; // clientsParams_[shard][node][client]
+
   std::vector<SparseTensor> localSparseGrads_;
   std::vector<SparseTensor> shardSparseGrads_;
   std::vector<SparseTensor> tmpSparseDeltas_; // @TODO: Find better name
-  std::vector<std::vector<SparseTensor>> localSparseDeltas_;
+  std::vector<SparseTensor> localSparseDeltas_; // localSparseDeltas_[gpu]
 
   std::vector<int> shardGlobalVersionNumbers_;
   std::vector<std::vector<int>> localVersionNumbers_;
@@ -927,6 +929,11 @@ private:
       THREAD_GUARD(builders_[i]->build(graphs_[i], batch);
                        graphs_[i]->forward(););
     }
+    shardGlobalVersionNumbers_.push_back(0);
+    std::vector<int> localVersions;
+    for(int node = 0; node < mpi_comm_world_size_; node++)
+      localVersions.push_back(0);
+    localVersionNumbers_.push_back(localVersions);
     cudaStreamSynchronize(0);
   }
 
@@ -950,7 +957,7 @@ private:
     size_t nodeShardSize = ceilf(((float) totalParamsGradsSize) / mpi_comm_world_size_);
     size_t remainingTotalSize = totalParamsGradsSize;
     for (int node = 0; node < mpi_comm_world_size_; node++) {
-      size_t size = std::min(nodeShardSize, remainingTotalSize);
+      size_t size = min(nodeShardSize, remainingTotalSize);
       nodeShardSizes_[node] = size;
       //LOG(info)->info("{} assigning node {} size {}", mpi_my_rank_, node, size);
       remainingTotalSize -= size;
@@ -961,28 +968,39 @@ private:
     size_t gpuShardSize = ceilf(((float) thisNodeSize) / devices_.size());
     size_t offset = 0;
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
-      size_t size = std::min(gpuShardSize, thisNodeSize - offset);
-      for (int his = 0; his < historySize_; his++) { // for gradient dropping
-        auto params = newTensor(size, devices_[gpu]);
-        params->copyFrom(graphs_[0]->params()->vals()->subtensor(offset, size));
-        cudaStreamSynchronize(0);
-        gpuShardParams_[his].push_back(params);
-      }
+      size_t size = min(gpuShardSize, thisNodeSize - offset);
+      Tensor gpuParams = newTensor(size, devices_[gpu]);
+      gpuParams->copyFrom(graphs_[0]->params()->vals()->subtensor(offset, size));
+      cudaStreamSynchronize(0);
+      gpuShardsParams_.push_back(gpuParams);
       if (dropRate_) {
         tmpTensor_.push_back(newTensor(size, devices_[gpu]));
 
         int sparseCap = size * 1.2 * (1.0 - dropRate_); // @TODO: Verify correct size
         shardSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu])));
+        // @TODO: Move local things elsewhere (e.g. initFirstBatch())
         localSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu])));
         tmpSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap / devices_.size(), devices_[gpu])));
-        std::vector<SparseTensor> sparseDeltas;
-        for (int i = 0; i < devices_.size(); i++) { // @TODO: Pretty sure this has to be per node not per GPU
-          sparseDeltas.push_back(SparseTensor(new SparseTensorBase(sparseCap / devices_.size(), devices_[gpu])));
+        localSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap / devices_.size(), devices_[gpu])));
+        // Initialize parameters communicated with all clients of this GPU shard (to compute deltas) + gradient droppers @TODO: Move droppers stuff to other function as well
+        std::vector<std::vector<Tensor>> clientParams;
+        std::vector<GradientDrop> gpuDroppers;
+        for (int node = 0; node < mpi_comm_world_size_; node++) {
+          std::vector<Tensor> nodeParams;
+          int nClients = devices_.size(); // @TODO: IMPORTANT! This needs to be dependent on the number of GPUs of 'node' (not of this node) => only works if all nodes have same number of GPUs
+          for (int client = 0; client < nClients; client++) {
+            Tensor clientTensor = newTensor(size, devices_[gpu]);
+            clientTensor->copyFrom(gpuParams); // copy initial shard params into tensor
+            cudaStreamSynchronize(0);
+            nodeParams.push_back(clientTensor);
+          }
+          clientParams.push_back(nodeParams);
+          gpuDroppers.push_back(GradientDrop(new GradientDropBase()));
         }
-        localSparseDeltas_.push_back(sparseDeltas);
-
+        clientsParams_.push_back(clientParams);
+        fetchDropper_.push_back(gpuDroppers); // fetchDropper_[gpu][node]
       }
-      gpuShardGrads_.push_back(newTensor(size, devices_[gpu]));
+      gpuShardsGrads_.push_back(newTensor(size, devices_[gpu]));
       //LOG(info)->info("{} assigning gpu {} size {}", mpi_my_rank_, gpu, size);
       gpuShardSizes_[gpu] = size;
       offset += size;
@@ -1031,13 +1049,13 @@ private:
             std::lock_guard<std::mutex> guard(mutexGpuShards_[gpu]);
 
             // Copy grads to appropriate GPU
-            cudaMemcpy(gpuShardGrads_[gpu]->data(), &serverShardBuffer_->at(offset), size * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(gpuShardsGrads_[gpu]->data(), &serverShardBuffer_->at(offset), size * sizeof(float), cudaMemcpyHostToDevice);
             cudaStreamSynchronize(0);
             // Run optimizer on GPU
-            gpuShardOpts_[gpu]->update(gpuShardParams_[0][gpu], gpuShardGrads_[gpu]);
+            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
             cudaStreamSynchronize(0);
             // Copy params from GPU
-            cudaMemcpy(&serverShardBuffer_->at(offset), gpuShardParams_[0][gpu]->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&serverShardBuffer_->at(offset), gpuShardsParams_[gpu]->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
             cudaStreamSynchronize(0);
             }, gpu, offset, size));
 
@@ -1072,17 +1090,17 @@ private:
             std::lock_guard<std::mutex> guard(mutexGpuShards_[gpu]);
 
             // Copy grads to appropriate GPU
-            gpuShardGrads_[gpu]->copyFrom(newGrads->subtensor(offset, size));
+            gpuShardsGrads_[gpu]->copyFrom(newGrads->subtensor(offset, size));
             cudaStreamSynchronize(0);
             // Run optimizer on GPU
             if (scale_lr) {
-              gpuShardOpts_[gpu]->update(gpuShardParams_[0][gpu], gpuShardGrads_[gpu], average_batch_words);
+              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], average_batch_words);
             } else {
-              gpuShardOpts_[gpu]->update(gpuShardParams_[0][gpu], gpuShardGrads_[gpu]);
+              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
             }
             cudaStreamSynchronize(0);
             // Copy params back to current GPU
-            oldParams->subtensor(offset, size)->copyFrom(gpuShardParams_[0][gpu]);
+            oldParams->subtensor(offset, size)->copyFrom(gpuShardsParams_[gpu]);
             cudaStreamSynchronize(0);
           }, gpu, localOffset, gpuSize));
 
@@ -1119,15 +1137,21 @@ private:
       MPI_Status status;
       do {
         // Receive grads from any client
-        size_t messageInfo[4]; // sparseGradsOffset, sparseGradsSize, batchWords, localVersionNumber
-        MPI_Recv(&messageInfo, 4, MPI_UNSIGNED_LONG, MPI_ANY_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, &status);
+        unsigned long messageInfo[5]; // sparseGradsOffset, sparseGradsSize, batchWords, localVersionNumber, clientId
+        LOG(info)->info("Server waiting for message");
+        MPI_Recv(&messageInfo, 5, MPI_UNSIGNED_LONG, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD, &status);
+        LOG(info)->info("Server received message 1");
         MPI_Recv(serverShardSparseBuffer1_->data(), messageInfo[1], MPI_INT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        LOG(info)->info("Server received message 2");
         MPI_Recv(serverShardSparseBuffer2_->data(), messageInfo[1], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        LOG(info)->info("Server received message 3");
 
         std::vector<std::thread> threads;
         size_t offset = 0;
+        size_t gradsSizePerGpu = ceilf(((float) messageInfo[1]) / devices_.size());
         for (int gpu = 0; gpu < devices_.size(); gpu++) {
-          size_t gradsSize = shardSparseGrads_[gpu]->size();
+          //size_t gradsSize = shardSparseGrads_[gpu]->size(); // @TODO: Is this correct?
+          size_t gradsSize = min(gradsSizePerGpu, messageInfo[1] - offset); // min(gradsSizePerGpu, remainingGradsSize)
           size_t gradsOffset = messageInfo[0] + offset; // sparseGradsOffset + offset
 
           threads.emplace_back(std::thread( [=] (int gpu, int offset, int gradsOffset, int gradsSize, int batchWords, int localVersionNumber) {
@@ -1139,30 +1163,33 @@ private:
             cudaStreamSynchronize(0);
 
             // Convert back to dense, for all index + gradsOffset >= 0
-            shardSparseGrads_[gpu]->toDense(gpuShardGrads_[gpu], -gradsOffset);
+            shardSparseGrads_[gpu]->toDense(gpuShardsGrads_[gpu], -gradsOffset);
             cudaStreamSynchronize(0); // @TODO: All these cudaStreamSynchronize(0); are probably not necessary if they are in the same queue
 
             // Apply and increment version number
-            int pastVersion = shardGlobalVersionNumbers_[gpu] % historySize_; // @TODO: Ask for clarification on the version numbers
-            int latestVersion = ++shardGlobalVersionNumbers_[gpu] % historySize_;
-            if (pastVersion != latestVersion) gpuShardParams_[latestVersion][gpu]->copyFrom(gpuShardParams_[pastVersion][gpu]);
+            //int pastVersion = shardGlobalVersionNumbers_[gpu] % historySize_; // @TODO: Ask for clarification on the version numbers => useless right?
+            //int latestVersion = ++shardGlobalVersionNumbers_[gpu] % historySize_;
+            //if (pastVersion != latestVersion) gpuShardsParams_[latestVersion][gpu]->copyFrom(gpuShardsParams_[pastVersion][gpu]);
 
             // Run optimizer on GPU
             if (scale_lr) {
-              gpuShardOpts_[gpu]->update(gpuShardParams_[latestVersion][gpu], gpuShardGrads_[gpu], batchWords);
+              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords);
             } else {
-              gpuShardOpts_[gpu]->update(gpuShardParams_[latestVersion][gpu], gpuShardGrads_[gpu]);
+              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
             }
             cudaStreamSynchronize(0);
 
+            // Update shard's last communicated parameters for node's client
+            clientsParams_[gpu][status.MPI_SOURCE][messageInfo[4]]->copyFrom(gpuShardsParams_[gpu]);
+            cudaStreamSynchronize(0);
+
             // Get deltas = params latest version - params local version
-            Element(_1 = _2 - _3, tmpTensor_[gpu], gpuShardParams_[latestVersion][gpu], gpuShardParams_[localVersionNumber][gpu]);
+            Element(_1 = _2 - _3, tmpTensor_[gpu], gpuShardsParams_[gpu], clientsParams_[status.MPI_SOURCE][gpu][messageInfo[4]]);
             cudaStreamSynchronize(0);
 
             // Get sparse delta
-            fetchDropper_[status.MPI_SOURCE][gpu]->dropGraph(tmpTensor_[gpu], tmpSparseDeltas_[gpu], dropRate_); // @TODO: Verify
+            fetchDropper_[gpu][status.MPI_SOURCE]->dropGraph(tmpTensor_[gpu], tmpSparseDeltas_[gpu], dropRate_); // @TODO: Verify
             cudaStreamSynchronize(0);
-
 
           }, gpu, offset, gradsOffset, gradsSize, messageInfo[2], messageInfo[3]));
 
@@ -1171,9 +1198,6 @@ private:
         for (auto && t : threads) { t.join(); }
 
         LOG(info)->info("Node {} size of sparse deltas: GPU0 {} GPU1 {}", mpi_my_rank_, tmpSparseDeltas_[0]->size(), tmpSparseDeltas_[1]->size());
-
-        // Send sparse deltas back to node
-        messageInfo[2] = shardGlobalVersionNumbers_[0]; // @TODO: Only need one global version number for this node
 
         // Copy sparse deltas from GPU (variable sizes so can't do in previous threads without losing accuracy) @TODO: Confirm this!
         threads.clear();
@@ -1192,13 +1216,17 @@ private:
         }
         for (auto && t : threads) { t.join(); }
 
+        // Send sparse deltas back to node
+
         size_t deltasSize = sparseDeltasOffset;
-        messageInfo[1] = deltasSize; // size
-        messageInfo[3] = shardGlobalVersionNumbers_[0]; // @TODO single node version number
+        messageInfo[1] = deltasSize;
+        //messageInfo[3] = shardGlobalVersionNumbers_[0]; // @TODO: Useless?
 
         MPI_Send(&messageInfo, 4, MPI_UNSIGNED_LONG, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD);
         MPI_Send(serverShardSparseBuffer1_->data(), deltasSize, MPI_INT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD);
         MPI_Send(serverShardSparseBuffer2_->data(), deltasSize, MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD);
+
+        LOG(info)->info("Server sent back messages, deltasSize: {}", deltasSize);
 
       } while (true/*@TODO: Add stop condition, e.g. message length*/);
     });
@@ -1207,7 +1235,7 @@ private:
 
   void sparseSynchronizeWithServerShards(SparseTensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
     #if MPI_FOUND
-    // Remotely (@TODO: Local)
+    // Remotely (@TODO: Local when node == mpi_my_rank_)
     size_t offset = 0;
     for (int node = 0; node < mpi_comm_world_size_; node++) {
       size_t nodeSize = nodeShardSizes_[node];
@@ -1215,31 +1243,40 @@ private:
       // Split sparse grads for node
       SparseTensor subShardGrads = newGrads->subtensor(offset, nodeSize, 0); // @TODO: Verify 3rd param (idx)
       cudaStreamSynchronize(0);
+      LOG(info)->info("split grads");
 
       // Copy to buffers
       std::lock_guard<std::mutex> guard(mutexClientCommBuffer_);
       cudaMemcpy(clientShardSparseBuffer1_->data(), subShardGrads->indices(), subShardGrads->size() * sizeof(int), cudaMemcpyDeviceToHost);
+      LOG(info)->info("copy to buffers 1");
       cudaMemcpy(clientShardSparseBuffer2_->data(), subShardGrads->data(), subShardGrads->size() * sizeof(float), cudaMemcpyDeviceToHost);
+      LOG(info)->info("copy to buffers 2");
 
-      // Send sparse grads to node
-      size_t messageInfo[] = {offset, (size_t) subShardGrads->size(), batchWords, (size_t) localVersionNumbers_[gpu][node]};
+      // Send sparse grads to node @TODO: In server set received tensor's size? (see copyFrom for sparseTensor)
+      unsigned long messageInfo[] = {(unsigned long) offset, (unsigned long) subShardGrads->size(), (unsigned long) batchWords, (unsigned long) localVersionNumbers_[gpu][node], (unsigned long) gpu}; // @TODO: Remove localVersion numbers?
+      LOG(info)->info("Client prepared messageInfo");
       MPI_Send(&messageInfo, 4, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
       MPI_Send(clientShardSparseBuffer1_->data(), subShardGrads->size(), MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
       MPI_Send(clientShardSparseBuffer2_->data(), subShardGrads->size(), MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);
+      LOG(info)->info("Client sent messages, size: {}", subShardGrads->size());
 
       // Receive sparse deltas from node
       MPI_Recv(&messageInfo, 4, MPI_UNSIGNED_LONG, node, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      LOG(info)->info("Client received messageInfo, deltasSize: {}", messageInfo[1]);
       MPI_Recv(clientShardSparseBuffer1_->data(), messageInfo[1], MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
       MPI_Recv(clientShardSparseBuffer2_->data(), messageInfo[1], MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      LOG(info)->info("Client received messages");
 
       // Copy to GPUs
-      cudaMemcpy(localSparseDeltas_[gpu][node]->indices(), clientShardSparseBuffer1_->data(), messageInfo[1] * sizeof(int), cudaMemcpyHostToDevice);
-      cudaMemcpy(localSparseDeltas_[gpu][node]->data(), clientShardSparseBuffer2_->data(), messageInfo[1] * sizeof(int), cudaMemcpyHostToDevice);
+      cudaMemcpy(localSparseDeltas_[gpu]->indices(), clientShardSparseBuffer1_->data(), messageInfo[1] * sizeof(int), cudaMemcpyHostToDevice);
+      cudaMemcpy(localSparseDeltas_[gpu]->data(), clientShardSparseBuffer2_->data(), messageInfo[1] * sizeof(float), cudaMemcpyHostToDevice);
+      LOG(info)->info("Client copied deltas to buffers");
       // Apply sparse deltas to params
-      localSparseDeltas_[gpu][node]->scatterAdd(oldParams->subtensor(offset, nodeSize));
+      localSparseDeltas_[gpu]->scatterAdd(oldParams->subtensor(offset, nodeSize));
       cudaStreamSynchronize(0);
+      LOG(info)->info("Client added deltas to params (DONE)");
 
-      localVersionNumbers_[gpu][node] = messageInfo[2];
+      //localVersionNumbers_[gpu][node] = messageInfo[2]; // @TODO: Useless?
 
       offset += nodeSize;
     }
@@ -1302,11 +1339,6 @@ private:
       if (dropRate_ && !gradientDropper) {
         std::lock_guard<std::mutex> guard(sync_);
         gradientDropper = GradientDrop(new GradientDropBase());
-        std::vector<GradientDrop> droppers;
-        for (int i = 0; i < devices_.size(); i++) {
-          droppers.push_back(GradientDrop(new GradientDropBase()));
-        }
-        fetchDropper_.push_back(droppers);
       }
 
       auto costNode = builder->build(graph, batch);
@@ -1438,15 +1470,12 @@ public:
     if (dropRate_ > 0.0) {
       historySize_ = devices_.size(); // devices_.size() * 1.5 @TODO: Per node instead of per device?
     }
-    for (int i = 0; i < historySize_; i++) {
-      gpuShardParams_.push_back(std::vector<Tensor>());
-    }
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
       graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
       graphs_.push_back(graph);
-      gpuShardOpts_.push_back(Optimizer(options_));
+      gpuShardsOpts_.push_back(Optimizer(options_));
       builders_.push_back(New<Builder>(options_, args...));
     }
   }
