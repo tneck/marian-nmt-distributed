@@ -888,7 +888,7 @@ private:
   std::vector<SparseTensor> localSparseDeltas_; // localSparseDeltas_[gpu]
 
   std::vector<std::vector<std::vector<GradientDrop>>> fetchDroppers_; // fetchDroppers_[shard][node][client]
-  std::vector<GradientDrop> gradientDroppers_; // gradientDroppers_[gpu]
+  std::vector<std::vector<GradientDrop>> gradientDroppers_; // gradientDroppers_[gpu][node]
   std::vector<Tensor> tmpDeltas_; // tmpDeltas_[gpu]
 
   double dropRate_{0};
@@ -982,10 +982,10 @@ private:
         // Client side @TODO: Move local things elsewhere (e.g. initFirstBatch())
         localSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu]))); // full before subtensor
         localSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap / mpi_comm_world_size_/*UNSURE*/, devices_[gpu]))); // subtensor over nodes
-        gradientDroppers_.push_back(GradientDrop(new GradientDropBase()));
         // Initialize parameters communicated with all clients of this GPU shard (to compute deltas) + gradient droppers @TODO: Move droppers stuff to other function as well
         std::vector<std::vector<Tensor>> clientParams;
         std::vector<std::vector<GradientDrop>> clientDroppers;
+        std::vector<GradientDrop> shardDroppers;
         for (int node = 0; node < mpi_comm_world_size_; node++) {
           std::vector<Tensor> nodeParams;
           std::vector<GradientDrop> nodeDroppers;
@@ -999,10 +999,11 @@ private:
           }
           clientParams.push_back(nodeParams);
           clientDroppers.push_back(nodeDroppers);
+          shardDroppers.push_back(GradientDrop(new GradientDropBase()));
         }
         clientsParams_.push_back(clientParams);
         fetchDroppers_.push_back(clientDroppers); // fetchDroppers_[shard][node][client]
-
+        gradientDroppers_.push_back(shardDroppers);
       }
       offset += size;
     }
@@ -1157,7 +1158,7 @@ private:
           //LOG(info)->info("Last index ({}th) is {}", endOffset - 1, serverShardSparseBuffer1_->at(endOffset));
           size_t gradsOffset = (size_t) serverShardSparseBuffer1_->at(offset); // first index for this GPU
 
-          //LOG(info)->info("Server allocating to GPU {} range {} to {}", gpu, offset, endOffset);
+          LOG(info)->info("Server allocating to GPU {} range {} to {}", gpu, offset, endOffset);
 
           //size_t gradsSize = shardSparseGrads_[gpu]->size(); // @TODO: Is this correct (no - too big I think => we need to double check the sizes at initialisation)?
           //size_t gradsSize = min(gradsSizePerGpu, messageInfo[1] - offset); // min(gradsSizePerGpu, remainingGradsSize)
@@ -1173,7 +1174,7 @@ private:
             cudaStreamSynchronize(0);
 
             // Convert back to dense, for all index + offset >= 0
-            shardSparseGrads_[gpu]->toDense(gpuShardsGrads_[gpu], -gpuShardSizes_[0] * gpu/*-gradsOffset*/);
+            shardSparseGrads_[gpu]->toDense(gpuShardsGrads_[gpu], -(/*messageInfo[4] + */gpuShardSizes_[0] * gpu)/*-gradsOffset*/);
             cudaStreamSynchronize(0); // @TODO: All these cudaStreamSynchronize(0); are probably not necessary if they are in the same stream (= queue?)
             //LOG(info)->info("Server shard {} converted to dense", gpu);
 
@@ -1241,7 +1242,7 @@ private:
     #endif
   }
 
-  void sparseSynchronizeWithServerShards(SparseTensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
+  void sparseSynchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
     #if MPI_FOUND
     // Remotely (@TODO: Local when node == mpi_my_rank_)
     //LOG(info)->info("{} In sparse", gpu);
@@ -1251,20 +1252,22 @@ private:
       size_t nodeSize = nodeShardSizes_[node];
 
       // Split sparse grads for node
-      SparseTensor subShardGrads = newGrads->subtensor(offset, nodeSize, /*gpu*//*0*/node);
+      Tensor subNewGrads = newGrads->subtensor(offset, nodeSize);
+      gradientDroppers_[gpu][node]->dropGraph(subNewGrads, localSparseGrads_[gpu], dropRate_);
+      SparseTensor sparseSubNewGrads = localSparseGrads_[gpu];
       cudaStreamSynchronize(0);
 
       // Copy to buffers
       std::lock_guard<std::mutex> guard(mutexClientCommBuffer_); // @TODO: IMPORTANT: If multiple buffers, also need to revise GPU buffers, e.g. localSparseDeltas_ would have to be a 2D vector
-      cudaMemcpy(clientShardSparseBuffer1_->data(), subShardGrads->indices(), subShardGrads->size() * sizeof(int), cudaMemcpyDeviceToHost);
-      cudaMemcpy(clientShardSparseBuffer2_->data(), subShardGrads->data(), subShardGrads->size() * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(clientShardSparseBuffer1_->data(), sparseSubNewGrads->indices(), sparseSubNewGrads->size() * sizeof(int), cudaMemcpyDeviceToHost);
+      cudaMemcpy(clientShardSparseBuffer2_->data(), sparseSubNewGrads->data(), sparseSubNewGrads->size() * sizeof(float), cudaMemcpyDeviceToHost);
       cudaStreamSynchronize(0);
 
       // Send sparse grads to node @TODO: In server set received tensor's size? (see copyFrom for sparseTensor)
-      unsigned long messageInfo[] = {(unsigned long) offset, (unsigned long) subShardGrads->size(), (unsigned long) batchWords, 0/*remove*/, (unsigned long) gpu}; // @TODO: Remove localVersion numbers?
+      unsigned long messageInfo[] = {(unsigned long) offset, (unsigned long) sparseSubNewGrads->size(), (unsigned long) batchWords, 0/*remove*/, (unsigned long) gpu}; // @TODO: Remove localVersion numbers?
       MPI_Send(&messageInfo, 5, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
-      MPI_Send(clientShardSparseBuffer1_->data(), subShardGrads->size(), MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
-      MPI_Send(clientShardSparseBuffer2_->data(), subShardGrads->size(), MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);;
+      MPI_Send(clientShardSparseBuffer1_->data(), sparseSubNewGrads->size(), MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
+      MPI_Send(clientShardSparseBuffer2_->data(), sparseSubNewGrads->size(), MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);;
 
       // Receive sparse deltas from node
       MPI_Recv(&messageInfo, 5, MPI_UNSIGNED_LONG, node, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1282,8 +1285,20 @@ private:
       // Apply sparse deltas to params
       int nShardsOnNode = devices_.size(); // @TODO: IMPORTANT This should depend on number of GPUs 'node' has
       size_t nodeShardSize = gpuShardSizes_[0]; // @TODO: IMPORTANT " " on size of each GPU shard on 'node'
+
+      size_t nodeOffset = 0;
       for (int nodeShard = 0; nodeShard < nShardsOnNode; nodeShard++) {
-        localSparseDeltas_[gpu]->subtensor(nodeShard * nodeShardSize, nodeShardSize, 0)->scatterAdd(oldParams->subtensor(offset + nodeShard * nodeShardSize, nodeSize));
+        size_t endOffset = nodeOffset;
+        while (endOffset + 1 < messageInfo[1] && clientShardSparseBuffer1_->at(endOffset) < clientShardSparseBuffer1_->at(endOffset + 1)) {
+          endOffset++;
+        }
+        endOffset++;
+        LOG(info)->info("Client allocating for nodeShard {} range {} to {}", nodeShard, nodeOffset, endOffset);
+
+        SparseTensorBase(localSparseDeltas_[gpu]->data() + nodeOffset, localSparseDeltas_[gpu]->indices() + nodeOffset, endOffset - nodeOffset, gpu).scatterAdd(oldParams->subtensor(offset, nodeSize), nodeShard * nodeShardSize);
+        //localSparseDeltas_[gpu]->subtensor(nodeShard * nodeShardSize, nodeShardSize, nodeShard)->scatterAdd(oldParams->subtensor(offset + nodeShard * nodeShardSize, nodeSize));
+
+        nodeOffset += endOffset;
       }
       //localSparseDeltas_[gpu]->scatterAdd(oldParams->subtensor(offset, nodeSize), 0); // @TODO: HERE!!
       cudaStreamSynchronize(0);
@@ -1338,8 +1353,6 @@ private:
       thread_local Tensor accGradients;
       thread_local Ptr<TensorAllocator> accAlloc;
 
-      thread_local GradientDrop gradientDropper;
-
       thread_local size_t my_id = 0;
 
       //LOG(info)->info("GPU {} STARTING COMPUTE", my_id);
@@ -1349,11 +1362,6 @@ private:
         my_id = i;
         graph = graphs_[i];
         builder = builders_[i++];
-      }
-
-      if (dropRate_ && !gradientDropper) {
-        std::lock_guard<std::mutex> guard(sync_);
-        gradientDropper = gradientDroppers_[my_id];
       }
 
       auto costNode = builder->build(graph, batch);
@@ -1390,9 +1398,8 @@ private:
       if (t % tau_ == 0) {
         if (dropRate_ && t) {
           //LOG(info)->info("GPU {} ABOUT TO DROP GRADS", my_id);
-          gradientDropper->dropGraph(gradients, localSparseGrads_[my_id], dropRate_);
           //LOG(info)->info("GPU {} DONE DROPPING GRADS, ABOUT TO SYNC", my_id);
-          sparseSynchronizeWithServerShards(localSparseGrads_[my_id], graph->params()->vals(), my_id, numSeenWords);
+          sparseSynchronizeWithServerShards(gradients, graph->params()->vals(), my_id, numSeenWords);
           //LOG(info)->info("GPU {} SYNC DONE", my_id);
         } else {
           synchronizeWithServerShards(gradients, graph->params()->vals(), numSeenWords);
