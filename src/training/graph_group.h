@@ -1241,7 +1241,7 @@ private:
         cudaStreamSynchronize(0);
 
         // Run optimizer on GPU
-        serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_);
+        serverShardOpt_->update(gpuBufferParams_, gpuBufferGrads_);
         cudaStreamSynchronize(0);
 
         // Copy params from GPU
