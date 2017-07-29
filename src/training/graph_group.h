@@ -1190,7 +1190,7 @@ private:
           cudaStreamSynchronize(0);
 
           // Run optimizer on GPU
-          serverShardOpt_->update(gpuBufferGrads_, gpuBufferParams_);
+          serverShardOpt_->update(gpuBufferParams_, gpuBufferGrads_);
 
           // Copy params from GPU
           cudaMemcpy(serverShardParams_->data(), gpuBufferParams_->data(), bytesToExchange, cudaMemcpyDeviceToHost);
