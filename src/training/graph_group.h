@@ -1156,6 +1156,8 @@ private:
     // Allocate memory on the first GPU for this shard's params and grads
     size_t size = nodeShardSizes_[mpi_my_rank_];
     gpuBufferParams_ = newTensor(size, devices_[0]);
+    gpuBufferParams_->copyFrom(graphs_[0]->params()->vals()->subtensor(0, size));
+    cudaStreamSynchronize(0);
     gpuBufferGrads_ = newTensor(size, devices_[0]);
     // Initialize server shard optimizer
     serverShardOpt_ = Optimizer(options_); // @TODO: Move to constructor?
