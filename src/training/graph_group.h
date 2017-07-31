@@ -855,18 +855,8 @@ private:
 
   // Client communication thread variables
 
-  std::thread clientCommThread_;
-
-  Ptr<std::vector<float>> clientCommBufferParams_;
-  Ptr<std::vector<float>> clientCommBufferGrads_; // @TODO: Make one of these per GPU?
-  std::mutex mutexClientCommBuffer_;
-  std::vector<std::mutex> mutexClientCommBuffers_;
-
-  std::vector<bool> commBuffersSynchronized_;
-  boost::shared_mutex mutexCommBufferSynchronized_;
-  boost::condition_variable_any cvCommBufferSynchronized_;
-
-  Ptr<OptimizerBase> basicSgdOptimizer_;
+  std::vector<std::vector<float>> clientCommBufferParams_; // per client (GPU)
+  std::vector<std::vector<float>> clientCommBufferGrads_;
 
   size_t * nodeShardSizes_; // @TODO: Clear dynamic variable in destructor
   size_t * gpuShardSizes_; // @TODO: Clear dynamic variable in destructor
@@ -874,6 +864,8 @@ private:
   /*
    * Sparse communication variables
    */
+
+  double dropRate_{0};
 
   Ptr<std::vector<int>> serverShardSparseBuffer1_; // @TODO: Shared pointer necessary? + Verify auto delete/clear
   Ptr<std::vector<float>> serverShardSparseBuffer2_;
@@ -885,18 +877,29 @@ private:
 
   std::vector<SparseTensor> localSparseGrads_;
   std::vector<SparseTensor> shardSparseGrads_;
-  std::vector<SparseTensor> tmpSparseDeltas_; // @TODO: Find better name
+  std::vector<SparseTensor> tmpSparseDeltas_;
   std::vector<SparseTensor> localSparseDeltas_; // localSparseDeltas_[gpu]
 
   std::vector<std::vector<std::vector<GradientDrop>>> fetchDroppers_; // fetchDroppers_[shard][node][client]
   std::vector<std::vector<GradientDrop>> gradientDroppers_; // gradientDroppers_[gpu][node]
   std::vector<Tensor> tmpDeltas_; // tmpDeltas_[gpu]
 
-  double dropRate_{0};
+  // Computations/communication overlap variables
 
-  // Additional compute (local) variables
+  bool commOverlap_{false};
+
+  std::vector<std::thread> clientCommThreads_;
+
+  std::vector<Tensor> gpuSwapParams_;
+  std::vector<Tensor> gpuSwapGrads_;
 
   std::vector<Tensor> localGPUSummedGrads_;
+  Ptr<OptimizerBase> basicSgdOptimizer_;
+
+  std::vector<bool> commBuffersSynchronized_;
+  std::vector<std::mutex> mutexCommBuffersSynchronized_;
+  std::vector<std::condition_variable> cvCommBuffersSynchronized_;
+
 
   /*
    *
@@ -1018,22 +1021,23 @@ private:
   }
 
   void initRemoteCommunicator() {
-    // Initialize client's communication buffer params and grads
-    size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
-    clientCommBufferParams_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
-    clientCommBufferGrads_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
-    commBuffersSynchronized_ = std::vector<bool>(devices_.size(), false); // @TODO: Move to constructor?
-    // Sparse client buffers
-    if (dropRate_) {
-      for (int i = 0; i < devices_.size(); i++) {
-        std::vector<int> indices(nodeShardSizes_[mpi_my_rank_]); // @TODO: Change to correct size => sparse(total)
-        std::vector<float> data(nodeShardSizes_[mpi_my_rank_]);
+    for (int gpu = 0; gpu < devices_.size(); gpu++) {
+      size_t size = dropRate_ ? nodeShardSizes_[mpi_my_rank_] : nodeShardSizes_[mpi_my_rank_]; // @TODO: Change dropRate size to correct => sparse(total)
+      std::vector<float> data(size);
+      if (dropRate_) {
+        std::vector<int> indices(size);
         clientShardSparseBuffer1_.push_back(indices);
         clientShardSparseBuffer2_.push_back(data);
+      } else {
+        std::vector<float> data2(size);
+        clientCommBufferParams_.push_back(data);
+        clientCommBufferGrads_.push_back(data2);
+      }
+      if (commOverlap_) {
+        gpuSwapParams_.push_back(newTensor(graphs_[0]->params()->vals()->size(), devices_[gpu]));
+        gpuSwapGrads_.push_back(newTensor(graphs_[0]->params()->grads()->size(), devices_[gpu]));
       }
     }
-    // Allocate memory on the first GPU for the buffer's params and grads
-    //size_t size = nodeShardSizes_[mpi_my_rank_];
   }
 
   void launchServerShardThread() {
@@ -1076,14 +1080,13 @@ private:
     #endif
   }
 
-  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, size_t batchWords) {
+  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
     #if MPI_FOUND
-
-    // Update remotely
     size_t offset = 0;
     for (int node = 0; node < mpi_comm_world_size_; node++) {
       size_t nodeSize = nodeShardSizes_[node];
 
+      // Update locally if this node
       if (node == mpi_my_rank_) {
         size_t localOffset = offset;
         std::vector<std::thread> threads;
@@ -1113,21 +1116,19 @@ private:
         }
         for (auto && t : threads) { t.join(); }
 
-        // Update remotely
-        } else {
-          std::lock_guard<std::mutex> guard(mutexClientCommBuffer_); // @TODO: Separate mutexes where more parallelisation is possible (e.g. here)
+      // Update remotely if other node
+      } else {
 
-          // Copy grads from GPU
-          cudaMemcpy(clientCommBufferGrads_->data(), newGrads->subtensor(offset, nodeSize)->data(), nodeSize * sizeof(float), cudaMemcpyDeviceToHost);
-          cudaStreamSynchronize(0);
-          // Send grads to server
-          MPI_Send(clientCommBufferGrads_->data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
-          //LOG(info)->info("{} Sending grads to {}, offset {} size {}", mpi_my_rank_, node, offset, nodeSize);
-          // Receive updated params from server
-          MPI_Recv(clientCommBufferParams_->data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-          // Copy params to GPU
-          cudaMemcpy(oldParams->subtensor(offset, nodeSize)->data(), clientCommBufferParams_->data(), nodeSize * sizeof(float), cudaMemcpyHostToDevice);
-          cudaStreamSynchronize(0);
+        // Copy grads from GPU
+        cudaMemcpy(clientCommBufferGrads_[gpu].data(), newGrads->subtensor(offset, nodeSize)->data(), nodeSize * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaStreamSynchronize(0);
+        // Send grads to server
+        MPI_Send(clientCommBufferGrads_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
+        // Receive updated params from server
+        MPI_Recv(clientCommBufferParams_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        // Copy params to GPU
+        cudaMemcpy(oldParams->subtensor(offset, nodeSize)->data(), clientCommBufferParams_[gpu].data(), nodeSize * sizeof(float), cudaMemcpyHostToDevice);
+        cudaStreamSynchronize(0);
       }
 
       offset += nodeSize;
@@ -1136,7 +1137,6 @@ private:
   }
 
   void launchSparseServerShardThread() {
-    // @TODO: Implement
     #if MPI_FOUND
     serverShardThread_ = std::thread( [this] {
       MPI_Status status;
@@ -1166,7 +1166,7 @@ private:
             cudaStreamSynchronize(0);
 
             // Convert back to dense, for all index + offset >= 0
-            shardSparseGrads_[gpu]->toDense(gpuShardsGrads_[gpu], -(/*messageInfo[4] + */gpuShardSizes_[0] * gpu)/*-gradsOffset*/);
+            shardSparseGrads_[gpu]->toDense(gpuShardsGrads_[gpu], -(gpuShardSizes_[0] * gpu)/*-gradsOffset*/);
             cudaStreamSynchronize(0); // @TODO: All these cudaStreamSynchronize(0); are probably not necessary if they are in the same stream (= queue?)
 
             // Run optimizer on GPU
@@ -1235,7 +1235,6 @@ private:
       cudaStreamSynchronize(0);
 
       // Copy to buffers
-      std::lock_guard<std::mutex> guard(mutexClientCommBuffers_[gpu]); // @TODO: IMPORTANT: If multiple buffers, also need to revise GPU buffers, e.g. localSparseDeltas_ would have to be a 2D vector -> actually, no
       cudaMemcpy(clientShardSparseBuffer1_[gpu].data(), sparseSubNewGrads->indices(), sparseSubNewGrads->size() * sizeof(int), cudaMemcpyDeviceToHost);
       cudaMemcpy(clientShardSparseBuffer2_[gpu].data(), sparseSubNewGrads->data(), sparseSubNewGrads->size() * sizeof(float), cudaMemcpyDeviceToHost);
       cudaStreamSynchronize(0);
@@ -1278,6 +1277,29 @@ private:
     #endif
   }
 
+  void launchCommOverlapThreads() {
+    #if MPI_FOUND
+    for (int gpu = 0; gpu < devices_.size(); gpu++) {
+      clientCommThreads_.emplace_back( std::thread( [this] (int gpu) {
+        do {
+          // Wait for graphs to exchange pointers
+          std::unique_lock<std::mutex> uniqueLock(mutexCommBuffersSynchronized_[gpu]);
+          while (!commBuffersSynchronized_[gpu]) {
+            cvCommBuffersSynchronized_[gpu].wait(uniqueLock);
+          }
+
+          // Synchronize with server shards
+
+
+          // Inidicate that pointers can be exchanged again
+          commBuffersSynchronized_[gpu] = false;
+
+        } while (true /*@TODO: Add stop condition*/);
+      }, gpu));
+    }
+    #endif
+  }
+
   void shutDownServerShardThread() {
     #if MPI_FOUND
     // @TODO: Cancel thread's loop - e.g. via MPI_Send([...], MPI_TAG_STOP_)
@@ -1285,10 +1307,10 @@ private:
     #endif
   }
 
-  void shutDownClientCommThread() {
+  void shutDownCommOverlapThreads() {
     #if MPI_FOUND
-    // @TODO: Cancel thread's loop - including escaping lock
-    clientCommThread_.join();
+    // @TODO: Cancel threads' loops - including escaping locks
+    for (int gpu = 0; gpu < devices_.size(); gpu++) { clientCommThreads_[gpu].join(); }
     #endif
   }
 
@@ -1368,7 +1390,7 @@ private:
           sparseSynchronizeWithServerShards(gradients, graph->params()->vals(), my_id, numSeenWords);
           //LOG(info)->info("GPU {} SYNC DONE", my_id);
         } else {
-          synchronizeWithServerShards(gradients, graph->params()->vals(), numSeenWords);
+          synchronizeWithServerShards(gradients, graph->params()->vals(), my_id, numSeenWords);
         }
         numSeenWords = 0;
 
@@ -1410,11 +1432,13 @@ public:
         devices_{options_->get<std::vector<size_t>>("devices")},
         pool_{devices_.size(), devices_.size()},
         mutexGpuShards_{devices_.size()},
-        mutexClientCommBuffers_{devices_.size()},
         movingAvg_{options_->get<bool>("moving-average")},
         mvDecay_{(float)options_->get<double>("moving-decay")},
         dropRate_{options_->get<double>("drop-rate")},
         tau_{options_->get<size_t>("tau")},
+        commBuffersSynchronized_(devices_.size(), false),
+        mutexCommBuffersSynchronized_{devices_.size()},
+        cvCommBuffersSynchronized_{devices_.size()},
         basicSgdOptimizer_{Optimizer<Sgd>(0.001, keywords::clip=Clipper<Norm>(1))} {
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
