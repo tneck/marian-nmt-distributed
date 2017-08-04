@@ -80,6 +80,22 @@ public:
 
   Tensor grads() { return grads_->asTensor(); }
 
+  Ptr<TensorAllocator> getValsAlloc() {
+    return vals_;
+  }
+
+  void setValsAlloc(Ptr<TensorAllocator> valsAlloc) {
+    vals_ = valsAlloc;
+  }
+
+  Ptr<TensorAllocator> getGradsAlloc() {
+    return grads_;
+  }
+
+  void setGradsAlloc(Ptr<TensorAllocator> gradsAlloc) {
+    grads_ = gradsAlloc;
+  }
+
   void clear() {
     params_.clear();
     named_.clear();

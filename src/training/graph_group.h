@@ -886,20 +886,19 @@ private:
 
   // Computations/communication overlap variables
 
-  bool commOverlap_{false};
+  bool commOverlap_{true}; // @TODO: Make this a run-time option
 
   std::vector<std::thread> clientCommThreads_;
 
-  std::vector<Tensor> gpuSwapParams_;
-  std::vector<Tensor> gpuSwapGrads_;
+  std::vector<Ptr<TensorAllocator>> gpuSwapParamsAlloc_;
+  std::vector<Ptr<TensorAllocator>> gpuSwapGradsAlloc_;
 
-  std::vector<Tensor> localGPUSummedGrads_;
+  std::vector<Ptr<TensorAllocator>> gpuSummedGradsAlloc_;
   Ptr<OptimizerBase> basicSgdOptimizer_;
 
-  std::vector<bool> commBuffersSynchronized_;
-  std::vector<std::mutex> mutexCommBuffersSynchronized_;
-  std::vector<std::condition_variable> cvCommBuffersSynchronized_;
-
+  std::vector<bool> gpuPointersSwapped_;
+  std::vector<std::mutex> mutexGpuPointersSwapped_;
+  std::vector<std::condition_variable> cvGpuPointersSwapped_;
 
   /*
    *
@@ -1034,8 +1033,17 @@ private:
         clientCommBufferGrads_.push_back(data2);
       }
       if (commOverlap_) {
-        gpuSwapParams_.push_back(newTensor(graphs_[0]->params()->vals()->size(), devices_[gpu]));
-        gpuSwapGrads_.push_back(newTensor(graphs_[0]->params()->grads()->size(), devices_[gpu]));
+        size_t fullSize = graphs_[0]->params()->vals()->size();
+        Tensor sumGrads = newTensor(fullSize, devices_[gpu]);
+        Element(_1 = 0, sumGrads);
+        cudaStreamSynchronize(0);
+        gpuSummedGradsAlloc_.push_back(allocators[allocators.size() -1]); // summed grads allocator at back
+        Tensor swapParams = newTensor(fullSize, devices_[gpu]);
+        swapParams->copyFrom(graphs_[0]->params()->vals());
+        cudaStreamSynchronize(0);
+        gpuSwapParamsAlloc_.push_back(allocators[allocators.size() - 1]); // grads allocator now at back
+        newTensor(fullSize, devices_[gpu]);
+        gpuSwapGradsAlloc_.push_back(allocators[allocators.size() - 1]); // params allocator now at back
       }
     }
   }
@@ -1080,7 +1088,7 @@ private:
     #endif
   }
 
-  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
+  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0) {
     #if MPI_FOUND
     size_t offset = 0;
     for (int node = 0; node < mpi_comm_world_size_; node++) {
@@ -1170,7 +1178,7 @@ private:
             cudaStreamSynchronize(0); // @TODO: All these cudaStreamSynchronize(0); are probably not necessary if they are in the same stream (= queue?)
 
             // Run optimizer on GPU
-            if (scale_lr) {
+            if (scale_lr && batchWords > 0) {
               gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords);
             } else {
               gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
@@ -1221,7 +1229,7 @@ private:
     #endif
   }
 
-  void sparseSynchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
+  void sparseSynchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0) {
     #if MPI_FOUND
     // Remotely (@TODO: Local when node == mpi_my_rank_)
     size_t offset = 0;
@@ -1282,17 +1290,27 @@ private:
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
       clientCommThreads_.emplace_back( std::thread( [this] (int gpu) {
         do {
-          // Wait for graphs to exchange pointers
-          std::unique_lock<std::mutex> uniqueLock(mutexCommBuffersSynchronized_[gpu]);
-          while (!commBuffersSynchronized_[gpu]) {
-            cvCommBuffersSynchronized_[gpu].wait(uniqueLock);
+          // Wait for GPU (client) to swap pointers
+          std::unique_lock<std::mutex> uniqueLock(mutexGpuPointersSwapped_[gpu]);
+          while (!gpuPointersSwapped_[gpu]) {
+            cvGpuPointersSwapped_[gpu].wait(uniqueLock);
           }
 
           // Synchronize with server shards
+          if (dropRate_) {
+            sparseSynchronizeWithServerShards(gpuSwapGradsAlloc_[gpu]->asTensor(), gpuSwapParamsAlloc_[gpu]->asTensor(), gpu);
+          } else {
+            synchronizeWithServerShards(gpuSwapGradsAlloc_[gpu]->asTensor(), gpuSwapParamsAlloc_[gpu]->asTensor(), gpu);
+          }
 
+          // @TODO: Apply sum grads to params!!
 
-          // Inidicate that pointers can be exchanged again
-          commBuffersSynchronized_[gpu] = false;
+          // Clear gradients (because they will be used as running sum in compute thread)
+          Element(_1 = 0, gpuSwapGradsAlloc_[gpu]->asTensor());
+          cudaStreamSynchronize(0);
+
+          // Indicate that pointers can be swapped again
+          gpuPointersSwapped_[gpu] = false;
 
         } while (true /*@TODO: Add stop condition*/);
       }, gpu));
@@ -1325,13 +1343,13 @@ private:
       } else {
         launchServerShardThread();
       }
+      if (commOverlap_) {
+        launchCommOverlapThreads();
+      }
       first_ = false;
     }
 
     auto task = [this](Ptr<data::Batch> batch) {
-      /*
-       * Node-local (mostly copied from AsyncGraphGroup)
-       */
       static size_t i = 0;
       thread_local Ptr<ExpressionGraph> graph;
       thread_local Ptr<Builder> builder;
@@ -1362,7 +1380,7 @@ private:
       size_t batchWords = batch->words();
 
       Tensor gradients;
-      if (tau_ > 1) {
+      if (!commOverlap_ && tau_ > 1) {
         if (t == 0) {
           accAlloc = New<TensorAllocator>(graph->getDevice());
           accAlloc->reserveExact(graph->params()->grads()->memory()->size());
@@ -1383,12 +1401,9 @@ private:
 
       cudaStreamSynchronize(0);
 
-      if (t % tau_ == 0) {
+      if (!commOverlap_ && t % tau_ == 0) {
         if (dropRate_ && t) {
-          //LOG(info)->info("GPU {} ABOUT TO DROP GRADS", my_id);
-          //LOG(info)->info("GPU {} DONE DROPPING GRADS, ABOUT TO SYNC", my_id);
           sparseSynchronizeWithServerShards(gradients, graph->params()->vals(), my_id, numSeenWords);
-          //LOG(info)->info("GPU {} SYNC DONE", my_id);
         } else {
           synchronizeWithServerShards(gradients, graph->params()->vals(), my_id, numSeenWords);
         }
@@ -1420,6 +1435,41 @@ private:
           scheduler_->validate(graph);
         }
       }
+
+      // Overlapping computations with communication
+      if (commOverlap_) {
+
+        // Add computed gradients to local running sum
+        Element(_1 = _1 + _2, gpuSummedGradsAlloc_[my_id]->asTensor(), gradients);
+        cudaStreamSynchronize(0);
+
+        // If communication channel ready, swap graph's pointers with secondary buffers
+        if (!gpuPointersSwapped_[my_id]) {
+          std::unique_lock<std::mutex> tryLock(mutexGpuPointersSwapped_[my_id], std::try_to_lock);
+          if (tryLock.owns_lock()) {
+
+            // Swap parameter allocators
+            auto paramsAllocator = graph->params()->getValsAlloc();
+            graph->params()->setValsAlloc(gpuSwapParamsAlloc_[my_id]);
+            gpuSwapParamsAlloc_[my_id] = paramsAllocator;
+
+            // Apply summed gradient to new parameters
+            //basicSgdOptimizer_->update(graph->params()->vals(), gpuSummedGradsAlloc_[my_id]->asTensor());
+
+            // Swap gradient allocators
+            auto gradsAllocator = gpuSummedGradsAlloc_[my_id];
+            gpuSummedGradsAlloc_[my_id] = gpuSwapGradsAlloc_[my_id];
+            gpuSwapGradsAlloc_[my_id] = gradsAllocator;
+
+            // Notify communication thread
+            gpuPointersSwapped_[my_id] = true;
+            cvGpuPointersSwapped_[my_id].notify_one();
+          }
+
+        }
+
+      }
+
     };
 
     pool_.enqueue(task, batch);
@@ -1436,9 +1486,9 @@ public:
         mvDecay_{(float)options_->get<double>("moving-decay")},
         dropRate_{options_->get<double>("drop-rate")},
         tau_{options_->get<size_t>("tau")},
-        commBuffersSynchronized_(devices_.size(), false),
-        mutexCommBuffersSynchronized_{devices_.size()},
-        cvCommBuffersSynchronized_{devices_.size()},
+        gpuPointersSwapped_(devices_.size(), false),
+        mutexGpuPointersSwapped_{devices_.size()},
+        cvGpuPointersSwapped_{devices_.size()},
         basicSgdOptimizer_{Optimizer<Sgd>(0.001, keywords::clip=Clipper<Norm>(1))} {
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
