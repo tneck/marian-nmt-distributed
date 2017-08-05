@@ -890,15 +890,15 @@ private:
 
   std::vector<std::thread> clientCommThreads_;
 
-  std::vector<Ptr<TensorAllocator>> gpuSwapParamsAlloc_;
-  std::vector<Ptr<TensorAllocator>> gpuSwapGradsAlloc_;
+  std::vector<Tensor> commBufferParams_;
+  std::vector<Tensor> commBufferGrads_;
 
-  std::vector<Ptr<TensorAllocator>> gpuSummedGradsAlloc_;
-  Ptr<OptimizerBase> basicSgdOptimizer_;
+  std::vector<Tensor> gpuSummedGrads_;
+  Ptr<OptimizerBase> localOptimizer_;
 
-  std::vector<bool> gpuPointersSwapped_;
-  std::vector<std::mutex> mutexGpuPointersSwapped_;
-  std::vector<std::condition_variable> cvGpuPointersSwapped_;
+  std::vector<bool> comBuffersFilled_;
+  std::vector<std::mutex> mutexCommBuffersFilled_;
+  std::vector<std::condition_variable> cvCommBuffersFilled_;
 
   /*
    *
@@ -1034,16 +1034,17 @@ private:
       }
       if (commOverlap_) {
         size_t fullSize = graphs_[0]->params()->vals()->size();
+        // Running sum of gradients
         Tensor sumGrads = newTensor(fullSize, devices_[gpu]);
         Element(_1 = 0, sumGrads);
         cudaStreamSynchronize(0);
-        gpuSummedGradsAlloc_.push_back(allocators[allocators.size() -1]); // summed grads allocator at back
-        Tensor swapParams = newTensor(fullSize, devices_[gpu]);
-        swapParams->copyFrom(graphs_[0]->params()->vals());
-        cudaStreamSynchronize(0);
-        gpuSwapParamsAlloc_.push_back(allocators[allocators.size() - 1]); // grads allocator now at back
-        newTensor(fullSize, devices_[gpu]);
-        gpuSwapGradsAlloc_.push_back(allocators[allocators.size() - 1]); // params allocator now at back
+        gpuSummedGrads_.push_back(sumGrads);
+        // Communication gradients buffer
+        commBufferGrads_.push_back(newTensor(fullSize, devices_[gpu]));
+        // Communication parameters buffer
+        Tensor bufferParams = newTensor(fullSize, devices_[gpu]);
+        bufferParams->copyFrom(graphs_[0]->params()->vals());
+        commBufferParams_.push_back(bufferParams);
       }
     }
   }
@@ -1290,27 +1291,23 @@ private:
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
       clientCommThreads_.emplace_back( std::thread( [this] (int gpu) {
         do {
-          // Wait for GPU (client) to swap pointers
-          std::unique_lock<std::mutex> uniqueLock(mutexGpuPointersSwapped_[gpu]);
-          while (!gpuPointersSwapped_[gpu]) {
-            cvGpuPointersSwapped_[gpu].wait(uniqueLock);
+          // Wait for GPU (client) to fill buffers pointers
+          std::unique_lock<std::mutex> uniqueLock(mutexCommBuffersFilled_[gpu]);
+          while (!comBuffersFilled_[gpu]) {
+            cvCommBuffersFilled_[gpu].wait(uniqueLock);
           }
 
           // Synchronize with server shards
           if (dropRate_) {
-            sparseSynchronizeWithServerShards(gpuSwapGradsAlloc_[gpu]->asTensor(), gpuSwapParamsAlloc_[gpu]->asTensor(), gpu);
+            //LOG(info)->info("{},{} sync sparse", mpi_my_rank_, gpu);
+            sparseSynchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu);
           } else {
-            synchronizeWithServerShards(gpuSwapGradsAlloc_[gpu]->asTensor(), gpuSwapParamsAlloc_[gpu]->asTensor(), gpu);
+            //LOG(info)->info("{},{} sync full", mpi_my_rank_, gpu);
+            synchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu);
           }
 
-          // @TODO: Apply sum grads to params!!
-
-          // Clear gradients (because they will be used as running sum in compute thread)
-          Element(_1 = 0, gpuSwapGradsAlloc_[gpu]->asTensor());
-          cudaStreamSynchronize(0);
-
-          // Indicate that pointers can be swapped again
-          gpuPointersSwapped_[gpu] = false;
+          // Indicate that buffers can be read from and filled again
+          comBuffersFilled_[gpu] = false;
 
         } while (true /*@TODO: Add stop condition*/);
       }, gpu));
@@ -1440,33 +1437,34 @@ private:
       if (commOverlap_) {
 
         // Add computed gradients to local running sum
-        Element(_1 = _1 + _2, gpuSummedGradsAlloc_[my_id]->asTensor(), gradients);
+        Element(_1 = _1 + _2, gpuSummedGrads_[my_id], gradients); // @TODO: Double check that this actually works
         cudaStreamSynchronize(0);
 
         // If communication channel ready, swap graph's pointers with secondary buffers
-        if (!gpuPointersSwapped_[my_id]) {
-          std::unique_lock<std::mutex> tryLock(mutexGpuPointersSwapped_[my_id], std::try_to_lock);
+        if (!comBuffersFilled_[my_id]) {
+          std::unique_lock<std::mutex> tryLock(mutexCommBuffersFilled_[my_id], std::try_to_lock);
           if (tryLock.owns_lock()) {
+            //LOG(info)->info("{},{} locked", mpi_my_rank_, my_id);
 
-            // Swap parameter allocators
-            auto paramsAllocator = graph->params()->getValsAlloc();
-            graph->params()->setValsAlloc(gpuSwapParamsAlloc_[my_id]);
-            gpuSwapParamsAlloc_[my_id] = paramsAllocator;
+            // Copy summed grads to communication buffer
+            commBufferGrads_[my_id]->copyFrom(gpuSummedGrads_[my_id]); // @TODO: Remove cudaStreamSynchronize in other places if called functions already do it
+            // Copy parameters from communication buffer
+            graph->params()->vals()->copyFrom(commBufferParams_[my_id]);
 
-            // Apply summed gradient to new parameters
-            //basicSgdOptimizer_->update(graph->params()->vals(), gpuSummedGradsAlloc_[my_id]->asTensor());
+            // Notify communication thread that buffers have been read and filled
+            comBuffersFilled_[my_id] = true;
+            cvCommBuffersFilled_[my_id].notify_one();
 
-            // Swap gradient allocators
-            auto gradsAllocator = gpuSummedGradsAlloc_[my_id];
-            gpuSummedGradsAlloc_[my_id] = gpuSwapGradsAlloc_[my_id];
-            gpuSwapGradsAlloc_[my_id] = gradsAllocator;
-
-            // Notify communication thread
-            gpuPointersSwapped_[my_id] = true;
-            cvGpuPointersSwapped_[my_id].notify_one();
+            // Apply summed gradients to new parameters
+            localOptimizer_->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
+            cudaStreamSynchronize(0);
+            // Clear summed gradients
+            Element(_1 = 0, gpuSummedGrads_[my_id]);
+            cudaStreamSynchronize(0);
           }
+          //else { LOG(info)->info("{},{} skipped lock", mpi_my_rank_, my_id); }
 
-        }
+        } //else { LOG(info)->info("{},{} skipped lock", mpi_my_rank_, my_id); }
 
       }
 
@@ -1486,10 +1484,10 @@ public:
         mvDecay_{(float)options_->get<double>("moving-decay")},
         dropRate_{options_->get<double>("drop-rate")},
         tau_{options_->get<size_t>("tau")},
-        gpuPointersSwapped_(devices_.size(), false),
-        mutexGpuPointersSwapped_{devices_.size()},
-        cvGpuPointersSwapped_{devices_.size()},
-        basicSgdOptimizer_{Optimizer<Sgd>(0.001, keywords::clip=Clipper<Norm>(1))} {
+        comBuffersFilled_(devices_.size(), false),
+        mutexCommBuffersFilled_{devices_.size()},
+        cvCommBuffersFilled_{devices_.size()},
+        localOptimizer_{Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1))} {
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
