@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
   if (mpiEnabled) {
     int provided_thread_mode = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_mode);
+    // MPI_Comm_set_errhandler(MPI_COMM_WORLD, MPI_ERRORS_RETURN); // Enable if occasional truncation errors
     MPI_Comm_size(MPI_COMM_WORLD, &comm_world_size);
     suitable_thread_mode = (provided_thread_mode >= MPI_THREAD_MULTIPLE);
   }

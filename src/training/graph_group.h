@@ -886,7 +886,7 @@ private:
 
   // Computations/communication overlap variables
 
-  bool commOverlap_{true}; // @TODO: Make this a run-time option
+  bool commOverlap_{false}; // @TODO: Make this a run-time option
 
   std::vector<std::thread> clientCommThreads_;
 
@@ -1075,7 +1075,7 @@ private:
         for (auto && t : threads) { t.join(); }
 
         // Send updated params to same client
-        MPI_Send(serverShardBuffer_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD);
+        MPI_Ssend(serverShardBuffer_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD);
 
       } while (true/*@TODO: Add stop condition, e.g. message length*/);
     });
@@ -1123,7 +1123,7 @@ private:
         cudaMemcpy(clientCommBufferGrads_[gpu].data(), newGrads->subtensor(offset, nodeSize)->data(), nodeSize * sizeof(float), cudaMemcpyDeviceToHost);
         cudaStreamSynchronize(0);
         // Send grads to server
-        MPI_Send(clientCommBufferGrads_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
+        MPI_Ssend(clientCommBufferGrads_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
         // Receive updated params from server
         MPI_Recv(clientCommBufferParams_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         // Copy params to GPU
@@ -1144,8 +1144,8 @@ private:
         // Receive sparse grads from any client
         unsigned long messageInfo[5]; // sparseGradsOffset, sparseGradsSize, batchWords, localVersionNumber, clientId
         MPI_Recv(&messageInfo, 5, MPI_UNSIGNED_LONG, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD, &status);
-        MPI_Recv(serverShardSparseBuffer1_->data(), messageInfo[1], MPI_INT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Recv(serverShardSparseBuffer2_->data(), messageInfo[1], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(serverShardSparseBuffer1_->data(), serverShardSparseBuffer1_->size(), MPI_INT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(serverShardSparseBuffer2_->data(), serverShardSparseBuffer2_->size(), MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
         std::vector<std::thread> threads;
         size_t offset = 0;
@@ -1210,9 +1210,9 @@ private:
         // Send sparse deltas back to node
         size_t deltasSize = sparseDeltasOffset;
         messageInfo[1] = deltasSize;
-        MPI_Send(&messageInfo, 5, MPI_UNSIGNED_LONG, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD);
-        MPI_Send(serverShardSparseBuffer1_->data(), deltasSize, MPI_INT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD);
-        MPI_Send(serverShardSparseBuffer2_->data(), deltasSize, MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD);
+        MPI_Ssend(&messageInfo, 5, MPI_UNSIGNED_LONG, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD);
+        MPI_Ssend(serverShardSparseBuffer1_->data(), deltasSize, MPI_INT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD);
+        MPI_Ssend(serverShardSparseBuffer2_->data(), deltasSize, MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD);
 
       } while (true/*@TODO: Add stop condition, e.g. message length*/);
     });
@@ -1238,14 +1238,14 @@ private:
 
       // Send sparse grads to node
       unsigned long messageInfo[] = {(unsigned long) offset, (unsigned long) sparseSubNewGrads->size(), (unsigned long) batchWords, 0/*remove*/, (unsigned long) gpu}; // @TODO: Remove localVersion numbers?
-      MPI_Send(&messageInfo, 5, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
-      MPI_Send(clientShardSparseBuffer1_[gpu].data(), sparseSubNewGrads->size(), MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
-      MPI_Send(clientShardSparseBuffer2_[gpu].data(), sparseSubNewGrads->size(), MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);;
+      MPI_Ssend(&messageInfo, 5, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
+      MPI_Ssend(clientShardSparseBuffer1_[gpu].data(), sparseSubNewGrads->size(), MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
+      MPI_Ssend(clientShardSparseBuffer2_[gpu].data(), sparseSubNewGrads->size(), MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);;
 
       // Receive sparse deltas from node
       MPI_Recv(&messageInfo, 5, MPI_UNSIGNED_LONG, node, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      MPI_Recv(clientShardSparseBuffer1_[gpu].data(), messageInfo[1], MPI_INT, node, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      MPI_Recv(clientShardSparseBuffer2_[gpu].data(), messageInfo[1], MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(clientShardSparseBuffer1_[gpu].data(), clientShardSparseBuffer1_[gpu].size(), MPI_INT, node, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(clientShardSparseBuffer2_[gpu].data(), clientShardSparseBuffer2_[gpu].size(), MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
       // Copy to GPUs
       cudaMemcpy(localSparseDeltas_[gpu]->indices(), clientShardSparseBuffer1_[gpu].data(), messageInfo[1] * sizeof(int), cudaMemcpyHostToDevice);
@@ -1305,7 +1305,7 @@ private:
 
   void shutDownServerShardThread() {
     #if MPI_FOUND
-    // @TODO: Cancel thread's loop - e.g. via MPI_Send([...], MPI_TAG_STOP_)
+    // @TODO: Cancel thread's loop - e.g. via MPI_Ssend([...], MPI_TAG_STOP_)
     serverShardThread_.join();
     #endif
   }
