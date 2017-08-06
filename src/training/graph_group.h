@@ -873,6 +873,8 @@ private:
   std::vector<std::vector<int>> clientShardSparseBuffer1_;
   std::vector<std::vector<float>> clientShardSparseBuffer2_;
 
+  std::vector<int> numberClientsOfNodes_;
+  std::vector<std::vector<size_t>> clientSizesOfNodes_;
   std::vector<std::vector<std::vector<Tensor>>> clientsParams_; // clientsParams_[shard][node][client]
 
   std::vector<SparseTensor> localSparseGrads_;
@@ -960,6 +962,9 @@ private:
     size_t gpuShardSize = ceilf(((float) thisNodeSize) / devices_.size());
     size_t offset = 0;
 
+    setupNumberClientsOfNodes();
+    setupClientSizesOfNodes();
+
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
       size_t size = min(gpuShardSize, thisNodeSize - offset);
 
@@ -979,6 +984,7 @@ private:
         // Client side @TODO: Move local things elsewhere (e.g. initFirstBatch())
         localSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu]))); // full before subtensor
         localSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap /*/ mpi_comm_world_size_@UNDO*//*UNSURE*/, devices_[gpu]))); // subtensor over nodes
+
         // Initialize parameters communicated with all clients of this GPU shard (to compute deltas) + gradient droppers @TODO: Move droppers stuff to other function as well
         std::vector<std::vector<Tensor>> clientParams;
         std::vector<std::vector<GradientDrop>> clientDroppers;
@@ -986,7 +992,7 @@ private:
         for (int node = 0; node < mpi_comm_world_size_; node++) {
           std::vector<Tensor> nodeParams;
           std::vector<GradientDrop> nodeDroppers;
-          int nClients = devices_.size(); // @TODO: IMPORTANT! This needs to be dependent on the number of GPUs of 'node' (not of this node) => only works if all nodes have same number of GPUs
+          int nClients = numberClientsOfNodes_[node];
           for (int client = 0; client < nClients; client++) {
             Tensor clientTensor = newTensor(size, devices_[gpu]);
             clientTensor->copyFrom(gpuParams); // copy initial shard params into tensor
@@ -1009,6 +1015,43 @@ private:
       serverShardSparseBuffer2_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_])); // @TODO: Change both to correct sizes
     } else {
       serverShardBuffer_ = Ptr<std::vector<float>>(new std::vector<float>(nodeShardSizes_[mpi_my_rank_]));
+    }
+  }
+
+  void setupNumberClientsOfNodes() {
+    numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_);
+    if (mpi_my_rank_ == 0) { // First node gathers and distributes nClients
+      numberClientsOfNodes_[0] = devices_.size(); // Set own number of clients
+      // Receive number of clients from each node
+      for (int node = 1; node < mpi_comm_world_size_; node++) {
+        MPI_Recv(&numberClientsOfNodes_[node], 1, MPI_INT, node, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      }
+      // Send to each node the number of clients for all nodes
+      for (int node = 1; node < mpi_comm_world_size_; node++) {
+        MPI_Ssend(numberClientsOfNodes_.data(), mpi_comm_world_size_, MPI_INT, node, 0, MPI_COMM_WORLD);
+      }
+    } else { // All other nodes send local number of clients and receive numberClientsOfNodes_
+      int nLocalClients = devices_.size(); // Set own number of clients
+      MPI_Ssend(&nLocalClients, 1, MPI_INT, 0, 0, MPI_COMM_WORLD); // Send to node 0 ("master")
+      MPI_Recv(numberClientsOfNodes_.data(), mpi_comm_world_size_, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE); // Receive numberClientsOfNodes_
+    }
+  }
+
+  void setupClientSizesOfNodes() {
+    for (int node = 0; node < mpi_comm_world_size_; node++) {
+      std::string s = "Node "; s += std::to_string(node) + " parameter sharding: ";
+
+      clientSizesOfNodes_.push_back(std::vector<size_t>());
+      size_t clientSize = ceilf(((float) nodeShardSizes_[node]) / numberClientsOfNodes_[node]);
+      size_t offset = 0;
+      for (int client = 0; client < numberClientsOfNodes_[node]; client++) {
+        size_t size = min(clientSize, nodeShardSizes_[node] - offset);
+        clientSizesOfNodes_[node].push_back(size);
+        offset += size;
+
+        s += "shard" + std::to_string(client); s += " " + std::to_string(size); s += client == numberClientsOfNodes_[node] - 1 ? "" : ", ";
+      }
+      if (mpi_my_rank_ == 0) { LOG(info)->info(s); } // If node 0, print parameter sharding layout
     }
   }
 
@@ -1192,7 +1235,7 @@ private:
         }
         for (auto && t : threads) { t.join(); }
 
-        // Copy sparse deltas from GPU (variable sizes so can't do in previous threads without losing accuracy) @TODO: Confirm this!
+        // Copy sparse deltas from GPU (varying sizes so can't do in previous "thread pool" without losing accuracy)
         threads.clear();
         size_t sparseDeltasOffset = 0;
         for (int gpu = 0; gpu < devices_.size(); gpu++) {
@@ -1254,10 +1297,9 @@ private:
       localSparseDeltas_[gpu]->setSize(messageInfo[1]);
 
       // Apply sparse deltas to params
-      int nShardsOnNode = devices_.size(); // @TODO: IMPORTANT This should depend on number of GPUs 'node' has
-      size_t nodeShardSize = gpuShardSizes_[0]; // @TODO: IMPORTANT " " on size of each GPU shard on 'node'
       size_t nodeOffset = 0;
-      for (int nodeShard = 0; nodeShard < nShardsOnNode; nodeShard++) {
+      size_t nodeShardSize = clientSizesOfNodes_[node][0];
+      for (int nodeShard = 0; nodeShard < numberClientsOfNodes_[node]; nodeShard++) {
         size_t endOffset = nodeOffset;
         while (endOffset + 1 < messageInfo[1] && clientShardSparseBuffer1_[gpu][endOffset] < clientShardSparseBuffer1_[gpu][endOffset + 1]) {
           endOffset++;
