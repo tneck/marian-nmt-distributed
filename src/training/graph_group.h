@@ -840,7 +840,8 @@ private:
 
   // Server (shard) thread variables
 
-  std::thread serverShardThread_;
+  std::thread * serverShardThread_;
+  bool stopServerShardThread_{false};
 
   Ptr<std::vector<float>> serverShardBuffer_; // @TODO: Shared pointer necessary? + Verify auto delete/clear
 
@@ -890,7 +891,8 @@ private:
 
   bool commOverlap_{false}; // @TODO: Make this a run-time option
 
-  std::vector<std::thread> clientCommThreads_;
+  std::vector<std::thread*> clientCommThreads_;
+  bool stopClientCommThreads_{false};
 
   std::vector<Tensor> commBufferParams_;
   std::vector<Tensor> commBufferGrads_;
@@ -1087,7 +1089,7 @@ private:
 
   void launchServerShardThread() {
     #if MPI_FOUND
-    serverShardThread_ = std::thread( [this] {
+    serverShardThread_ = new std::thread( [this] {
       MPI_Status status;
       do {
         // Receive grads from any client
@@ -1120,7 +1122,7 @@ private:
         // Send updated params to same client
         MPI_Ssend(serverShardBuffer_->data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD);
 
-      } while (true/*@TODO: Add stop condition, e.g. message length*/);
+      } while (!stopServerShardThread_);
     });
     #endif
   }
@@ -1181,7 +1183,7 @@ private:
 
   void launchSparseServerShardThread() {
     #if MPI_FOUND
-    serverShardThread_ = std::thread( [this] {
+    serverShardThread_ = new std::thread( [this] {
       MPI_Status status;
       do {
         // Receive sparse grads from any client
@@ -1257,7 +1259,7 @@ private:
         MPI_Ssend(serverShardSparseBuffer1_->data(), deltasSize, MPI_INT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD);
         MPI_Ssend(serverShardSparseBuffer2_->data(), deltasSize, MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD);
 
-      } while (true/*@TODO: Add stop condition, e.g. message length*/);
+      } while (!stopServerShardThread_);
     });
     #endif
   }
@@ -1283,7 +1285,7 @@ private:
       unsigned long messageInfo[] = {(unsigned long) offset, (unsigned long) sparseSubNewGrads->size(), (unsigned long) batchWords, 0/*remove*/, (unsigned long) gpu}; // @TODO: Remove localVersion numbers?
       MPI_Ssend(&messageInfo, 5, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
       MPI_Ssend(clientShardSparseBuffer1_[gpu].data(), sparseSubNewGrads->size(), MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
-      MPI_Ssend(clientShardSparseBuffer2_[gpu].data(), sparseSubNewGrads->size(), MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);;
+      MPI_Ssend(clientShardSparseBuffer2_[gpu].data(), sparseSubNewGrads->size(), MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);
 
       // Receive sparse deltas from node
       MPI_Recv(&messageInfo, 5, MPI_UNSIGNED_LONG, node, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1319,7 +1321,7 @@ private:
   void launchCommOverlapThreads() {
     #if MPI_FOUND
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
-      clientCommThreads_.emplace_back( std::thread( [this] (int gpu) {
+      clientCommThreads_.emplace_back( new std::thread( [this] (int gpu) {
         do {
           // Wait for GPU (client) to fill buffers pointers
           std::unique_lock<std::mutex> uniqueLock(mutexCommBuffersFilled_[gpu]);
@@ -1339,23 +1341,48 @@ private:
           // Indicate that buffers can be read from and filled again
           comBuffersFilled_[gpu] = false;
 
-        } while (true /*@TODO: Add stop condition*/);
+        } while (!stopClientCommThreads_);
       }, gpu));
     }
     #endif
   }
 
-  void shutDownServerShardThread() {
+  void shutDownServerShardThread() { // @TODO: Test if this works properly
     #if MPI_FOUND
-    // @TODO: Cancel thread's loop - e.g. via MPI_Ssend([...], MPI_TAG_STOP_)
-    serverShardThread_.join();
+    LOG(info)->info("Node {} about to shut down server thread", mpi_my_rank_);
+    stopServerShardThread_ = true;
+
+    if (dropRate_) { // Stop sparse server shard thread
+      // Send dummy messages to server
+      unsigned long dummyMessageInfo[] = {0, 0, 0, 0, 0};
+      MPI_Ssend(&dummyMessageInfo, 5, MPI_UNSIGNED_LONG, 0, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
+      MPI_Ssend(clientShardSparseBuffer1_[0].data(), 1, MPI_INT, 0, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
+      MPI_Ssend(clientShardSparseBuffer2_[0].data(), 1, MPI_FLOAT, 0, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);
+      // Receive server response (and discard contents)
+      MPI_Recv(&dummyMessageInfo, 5, MPI_UNSIGNED_LONG, 0, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(clientShardSparseBuffer1_[0].data(), clientShardSparseBuffer1_[0].size(), MPI_INT, 0, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(clientShardSparseBuffer2_[0].data(), clientShardSparseBuffer2_[0].size(), MPI_FLOAT, 0, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    } // Stop normal server shard thread
+    else {
+      MPI_Ssend(clientCommBufferGrads_[0].data(), 1, MPI_FLOAT, 0, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD); // Send dummy grads to server
+      MPI_Recv(clientCommBufferParams_[0].data(), nodeShardSizes_[0], MPI_FLOAT, 0, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE); // Receive server response (and discard contents)
+    }
+    serverShardThread_->join();
+    LOG(info)->info("Node {} successfully shut down server thread", mpi_my_rank_);
     #endif
   }
 
   void shutDownCommOverlapThreads() {
     #if MPI_FOUND
-    // @TODO: Cancel threads' loops - including escaping locks
-    for (int gpu = 0; gpu < devices_.size(); gpu++) { clientCommThreads_[gpu].join(); }
+    LOG(info)->info("Node {} about to shut down client communication threads", mpi_my_rank_);
+    stopClientCommThreads_ = true;
+    for (int gpu = 0; gpu < devices_.size(); gpu++) {
+      comBuffersFilled_[gpu] = true; // Let thread synchronise with servers to finish execution
+      cvCommBuffersFilled_[gpu].notify_one(); // Notify in case thread in lock
+      clientCommThreads_[gpu]->join();
+    }
+    LOG(info)->info("Node {} successfully shut down client communication threads", mpi_my_rank_);
     #endif
   }
 
@@ -1526,6 +1553,11 @@ public:
       gpuShardsOpts_.push_back(Optimizer(options_));
       builders_.push_back(New<Builder>(options_, args...));
     }
+  }
+
+  ~MultiNodeAsyncGraphGroup() {
+    if (commOverlap_) { shutDownCommOverlapThreads(); } // Order is important, this needs to run before server threads are shut down
+    shutDownServerShardThread();
   }
 
   void update(Ptr<data::Batch> batch) { execute(batch); }
