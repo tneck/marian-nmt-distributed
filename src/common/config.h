@@ -3,6 +3,7 @@
 #include <boost/program_options.hpp>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <random>
 
 #include "3rd_party/yaml-cpp/yaml.h"
 #include "common/config_parser.h"
@@ -46,7 +47,7 @@ public:
     };
 
     if(get<size_t>("seed") == 0)
-      seed = (size_t)time(0);
+      seed = (size_t)time(0) + std::random_device{}();
     else
       seed = get<size_t>("seed");
 
