@@ -1009,8 +1009,8 @@ private:
     }
     // Initialize send/receive buffers
     if (dropRate_) {
-      serverShardSparseBuffer1_ = std::vector<int>(sparseCap * 2); // x2 to be safe, it's small anyway
-      serverShardSparseBuffer2_ = std::vector<float>(sparseCap * 2);
+      serverShardSparseBuffer1_ = std::vector<int>(nodeShardSizes_[mpi_my_rank_]); // @ TODO: Should actually be sparse(X) instead of X but this causes very sporadic crashes
+      serverShardSparseBuffer2_ = std::vector<float>(nodeShardSizes_[mpi_my_rank_]);
     } else {
       serverShardBuffer_ = std::vector<float>(nodeShardSizes_[mpi_my_rank_]);
     }
