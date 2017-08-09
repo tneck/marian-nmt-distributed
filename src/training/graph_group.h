@@ -885,7 +885,7 @@ private:
 
   // Computations/communication overlap variables
 
-  bool commOverlap_{false}; // @TODO: Make this a run-time/config option
+  bool commOverlap_{true}; // @TODO: Make this a run-time/config option
 
   std::vector<std::thread*> clientCommThreads_;
   bool stopClientCommThreads_{false};
