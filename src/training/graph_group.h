@@ -823,6 +823,8 @@ private:
    *
    */
 
+  size_t batchIter_ = 0; // For dividing batches amongst nodes
+
   // MPI variables
 
   int mpi_my_rank_{0};
@@ -1551,7 +1553,12 @@ public:
     shutDownServerShardThread();
   }
 
-  void update(Ptr<data::Batch> batch) { execute(batch); }
+  void update(Ptr<data::Batch> batch) {
+    if (batchIter_ % mpi_comm_world_size_ == mpi_my_rank_) { // Only take batch assigned to this node (@INFO: Changing seed randomizer across nodes instead of this gives worse results)
+      execute(batch);
+    }
+    batchIter_++;
+  }
 
   void load() {
     if(!options_->get<bool>("no-reload")) {
