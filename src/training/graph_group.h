@@ -896,7 +896,7 @@ private:
   std::vector<Tensor> commBufferGrads_;
 
   std::vector<Tensor> gpuSummedGrads_;
-  Ptr<OptimizerBase> localOptimizer_;
+  std::vector<Ptr<OptimizerBase>> localOptimizers_;
 
   std::vector<bool> commBuffersFilled_;
   std::vector<std::mutex> mutexCommBuffersFilled_;
@@ -1505,16 +1505,13 @@ private:
             commBuffersFilled_[my_id] = true;
             cvCommBuffersFilled_[my_id].notify_one();
 
-            // Apply summed gradients to new parameters
-            localOptimizer_->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
-            cudaStreamSynchronize(0);
             // Clear summed gradients
             Element(_1 = 0, gpuSummedGrads_[my_id]);
             cudaStreamSynchronize(0);
           }
-          //else { LOG(info)->info("{},{} skipped lock", mpi_my_rank_, my_id); }
+          else { localOptimizers_[my_id]->update(graph->params()->vals(), gradients); }
 
-        } //else { LOG(info)->info("{},{} skipped lock", mpi_my_rank_, my_id); }
+        } else { localOptimizers_[my_id]->update(graph->params()->vals(), gradients); } // Local full optimizer
 
       }
 
@@ -1536,14 +1533,14 @@ public:
         tau_{options_->get<size_t>("tau")},
         commBuffersFilled_(devices_.size(), false),
         mutexCommBuffersFilled_{devices_.size()},
-        cvCommBuffersFilled_{devices_.size()},
-        localOptimizer_{Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1))} {
+        cvCommBuffersFilled_{devices_.size()} {
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
       graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
       graphs_.push_back(graph);
       gpuShardsOpts_.push_back(Optimizer(options_));
+      localOptimizers_.push_back(Optimizer(options_));
       builders_.push_back(New<Builder>(options_, args...));
     }
   }
