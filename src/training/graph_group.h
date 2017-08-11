@@ -889,6 +889,9 @@ private:
 
   bool commOverlap_{true}; // @TODO: Make this a run-time/config option
 
+  bool commOverlapSingleActive_{false}; // Whether only one overlap thread can use communication channel at any time @TODO: Make run-time/config option
+  std::mutex mutexCommChannel_; // Mutex to limit communication channel to one overlapping thread (if commOverlapSingleActive_ == true)
+
   std::vector<std::thread*> clientCommThreads_;
   bool stopClientCommThreads_{false};
 
@@ -1122,7 +1125,7 @@ private:
     #endif
   }
 
-  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0) {
+  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr) {
     #if MPI_FOUND
     size_t offset = 0;
     for (int node = 0; node < mpi_comm_world_size_; node++) {
@@ -1134,10 +1137,16 @@ private:
         // Copy grads from GPU
         cudaMemcpy(clientCommBufferGrads_[gpu].data(), newGrads->subtensor(offset, nodeSize)->data(), nodeSize * sizeof(float), cudaMemcpyDeviceToHost);
         cudaStreamSynchronize(0);
-        // Send grads to server
-        MPI_Ssend(clientCommBufferGrads_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
-        // Receive updated params from server
-        MPI_Recv(clientCommBufferParams_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        {
+          std::unique_lock<std::mutex> uniqueAccess = (optionalBlockMutex == nullptr) ? std::unique_lock<std::mutex>() : std::unique_lock<std::mutex>(*optionalBlockMutex, std::try_to_lock); // Lock mutex if provided
+
+          // Send grads to server
+          MPI_Ssend(clientCommBufferGrads_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
+          // Receive updated params from server
+          MPI_Recv(clientCommBufferParams_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+
         // Copy params to GPU
         cudaMemcpy(oldParams->subtensor(offset, nodeSize)->data(), clientCommBufferParams_[gpu].data(), nodeSize * sizeof(float), cudaMemcpyHostToDevice);
         cudaStreamSynchronize(0);
@@ -1257,7 +1266,7 @@ private:
     #endif
   }
 
-  void sparseSynchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0) {
+  void sparseSynchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr) {
     #if MPI_FOUND
     size_t offset = 0;
     for (int node = 0; node < mpi_comm_world_size_; node++) {
@@ -1273,17 +1282,26 @@ private:
       cudaMemcpy(clientShardSparseBuffer2_[gpu].data(), sparseSubNewGrads->data(), sparseSubNewGrads->size() * sizeof(float), cudaMemcpyDeviceToHost);
       cudaStreamSynchronize(0);
 
-      // Send sparse grads to node
       unsigned long messageInfo[3];
-      messageInfo[SPARSE_INFO_SIZE_] = sparseSubNewGrads->size(); messageInfo[SPARSE_INFO_CLIENT_] = gpu; messageInfo[SPARSE_INFO_BATCHWORDS_] = batchWords;
-      MPI_Ssend(&messageInfo, 3, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
-      MPI_Ssend(clientShardSparseBuffer1_[gpu].data(), messageInfo[SPARSE_INFO_SIZE_], MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
-      MPI_Ssend(clientShardSparseBuffer2_[gpu].data(), messageInfo[SPARSE_INFO_SIZE_], MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);
+      {
+        std::unique_lock<std::mutex> uniqueAccess = (optionalBlockMutex  == nullptr) ? std::unique_lock<std::mutex>() : std::unique_lock<std::mutex>(*optionalBlockMutex, std::try_to_lock); // Lock mutex if provided
+        if (uniqueAccess.owns_lock()) {
+          LOG(info)->info("{} {} owns lock", mpi_my_rank_, gpu);
+        } else {
+          LOG(info)->info("{} {} tried lock", mpi_my_rank_, gpu);
+        }
 
-      // Receive sparse deltas from node
-      MPI_Recv(&messageInfo, 3, MPI_UNSIGNED_LONG, node, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      MPI_Recv(clientShardSparseBuffer1_[gpu].data(), clientShardSparseBuffer1_[gpu].size(), MPI_INT, node, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      MPI_Recv(clientShardSparseBuffer2_[gpu].data(), clientShardSparseBuffer2_[gpu].size(), MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        // Send sparse grads to node
+        messageInfo[SPARSE_INFO_SIZE_] = sparseSubNewGrads->size(); messageInfo[SPARSE_INFO_CLIENT_] = gpu; messageInfo[SPARSE_INFO_BATCHWORDS_] = batchWords;
+        MPI_Ssend(&messageInfo, 3, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
+        MPI_Ssend(clientShardSparseBuffer1_[gpu].data(), messageInfo[SPARSE_INFO_SIZE_], MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
+        MPI_Ssend(clientShardSparseBuffer2_[gpu].data(), messageInfo[SPARSE_INFO_SIZE_], MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);
+
+        // Receive sparse deltas from node
+        MPI_Recv(&messageInfo, 3, MPI_UNSIGNED_LONG, node, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(clientShardSparseBuffer1_[gpu].data(), clientShardSparseBuffer1_[gpu].size(), MPI_INT, node, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(clientShardSparseBuffer2_[gpu].data(), clientShardSparseBuffer2_[gpu].size(), MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      }
 
       // Copy to GPUs
       cudaMemcpy(localSparseDeltas_[gpu]->indices(), clientShardSparseBuffer1_[gpu].data(), messageInfo[SPARSE_INFO_SIZE_] * sizeof(int), cudaMemcpyHostToDevice);
@@ -1324,11 +1342,9 @@ private:
 
           // Synchronize with server shards
           if (dropRate_) {
-            //LOG(info)->info("{},{} sync sparse", mpi_my_rank_, gpu);
-            sparseSynchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu);
+            sparseSynchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
           } else {
-            //LOG(info)->info("{},{} sync full", mpi_my_rank_, gpu);
-            synchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu);
+            synchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
           }
 
           // Indicate that buffers can be read from and filled again
