@@ -850,7 +850,7 @@ private:
 
   std::mutex mutexGpuBuffer_;
 
-  // Client communication thread variables
+  // Client communication variables
 
   std::vector<std::vector<float>> clientCommBufferParams_; // per client (GPU)
   std::vector<std::vector<float>> clientCommBufferGrads_;
@@ -858,9 +858,7 @@ private:
   std::vector<size_t> nodeShardSizes_;
   std::vector<size_t> gpuShardSizes_;
 
-  /*
-   * Sparse communication variables
-   */
+  // Sparse communication variables
 
   double dropRate_{0};
 
