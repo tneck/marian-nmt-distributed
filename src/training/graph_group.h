@@ -896,7 +896,7 @@ private:
   std::vector<Tensor> commBufferGrads_;
 
   std::vector<Tensor> gpuSummedGrads_;
-  Ptr<OptimizerBase> localOptimizer_;
+  std::vector<Ptr<OptimizerBase>> localOpts_;
 
   std::vector<bool> commBuffersFilled_;
   std::vector<std::mutex> mutexCommBuffersFilled_;
@@ -1506,7 +1506,7 @@ private:
             cvCommBuffersFilled_[my_id].notify_one();
 
             // Apply summed gradients to new parameters
-            localOptimizer_->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
+            localOpts_[my_id]->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
             cudaStreamSynchronize(0);
             // Clear summed gradients
             Element(_1 = 0, gpuSummedGrads_[my_id]);
@@ -1536,14 +1536,14 @@ public:
         tau_{options_->get<size_t>("tau")},
         commBuffersFilled_(devices_.size(), false),
         mutexCommBuffersFilled_{devices_.size()},
-        cvCommBuffersFilled_{devices_.size()},
-        localOptimizer_{Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1))} {
+        cvCommBuffersFilled_{devices_.size()} {
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
       graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
       graphs_.push_back(graph);
       gpuShardsOpts_.push_back(Optimizer(options_));
+      localOpts_.push_back(Optimizer(options)); // => for simple SGD opt: localOpts_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
       builders_.push_back(New<Builder>(options_, args...));
     }
   }
