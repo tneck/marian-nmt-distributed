@@ -888,9 +888,7 @@ private:
   // Computations/communication overlap variables
 
   bool commOverlap_{true}; // @TODO: Make this a run-time/config option
-
-  std::vector<std::thread*> clientCommThreads_;
-  bool stopClientCommThreads_{false};
+  bool singleCommOverlapThread_{true}; // @TODO " "
 
   std::vector<Tensor> commBufferParams_;
   std::vector<Tensor> commBufferGrads_;
@@ -898,9 +896,20 @@ private:
   std::vector<Tensor> gpuSummedGrads_;
   std::vector<Ptr<OptimizerBase>> localOptimizers_;
 
+  // Multiple communication threads
   std::vector<bool> commBuffersFilled_;
   std::vector<std::mutex> mutexCommBuffersFilled_;
   std::vector<std::condition_variable> cvCommBuffersFilled_;
+
+  // Single communication thread
+  std::vector<std::thread*> clientCommThreads_;
+  bool stopClientCommThreads_{false};
+  std::thread clientCommThread_;
+  Tensor singleCommBufferGrads_;
+  Tensor singleCommBufferTempGrads_;
+  Tensor singleCommBufferParams_;
+  boost::shared_mutex mutexCommBufferSynchronized_;
+  boost::condition_variable_any cvCommBufferSynchronized_;
 
   /*
    *
@@ -1057,7 +1066,7 @@ private:
 
   void initRemoteCommunicator() {
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
-      size_t size = dropRate_ ? (nodeShardSizes_[mpi_my_rank_]  * 1.2 * (1.0 - dropRate_)) : nodeShardSizes_[mpi_my_rank_];
+      size_t size = dropRate_ ? (nodeShardSizes_[mpi_my_rank_]  * 1.4 * (1.0 - dropRate_)) : nodeShardSizes_[mpi_my_rank_]; // * 1.4 instead of 1.2 to be safe
       if (dropRate_) {
         clientShardSparseBuffer1_.push_back(std::vector<int>(size));
         clientShardSparseBuffer2_.push_back(std::vector<float>(size));
@@ -1079,6 +1088,13 @@ private:
         bufferParams->copyFrom(graphs_[0]->params()->vals());
         commBufferParams_.push_back(bufferParams);
       }
+    }
+    if (commOverlap_ && singleCommOverlapThread_) {
+      // Single overlap main grads and params buffers
+      singleCommBufferGrads_ = newTensor(graphs_[0]->params()->vals()->size(), devices_[0]); // allocate to GPU 0
+      singleCommBufferTempGrads_ = newTensor(graphs_[0]->params()->vals()->size(), devices_[0]);
+      singleCommBufferParams_ = newTensor(graphs_[0]->params()->vals()->size(), devices_[0]);
+      singleCommBufferParams_->copyFrom(graphs_[0]->params()->vals());
     }
   }
 
@@ -1311,6 +1327,50 @@ private:
     #endif
   }
 
+  void launchSingleCommOverlapThread() {
+    #if MPI_FOUND
+    clientCommThread_ = std::thread( [this] {
+      do {
+        // Wait for graph grads to be copied to buffer
+        boost::unique_lock<boost::shared_mutex> unique_lock(mutexCommBufferSynchronized_);
+        while (!std::all_of(commBuffersFilled_.begin(), commBuffersFilled_.end(), [](bool v) { return v; })) { // while not all true
+          cvCommBufferSynchronized_.wait(unique_lock);
+        }
+
+        // Accumulate sums of grads from clients (GPUs) to main buffer (located on GPU 0)
+        for (int gpu = 0; gpu < devices_.size(); gpu++) {
+          singleCommBufferTempGrads_->copyFrom(commBufferGrads_[gpu]);
+          Element(_1 = _1 + _2, singleCommBufferGrads_, singleCommBufferTempGrads_);
+          cudaStreamSynchronize(0);
+        }
+
+        // Synchronize sum with server shards
+        if (dropRate_) {
+          sparseSynchronizeWithServerShards(singleCommBufferGrads_, singleCommBufferParams_, 0);
+        } else {
+          synchronizeWithServerShards(singleCommBufferGrads_, singleCommBufferParams_, 0);
+        }
+
+        // Copy latest params from main buffer to clients (GPUs)
+        std::vector<std::thread> threads;
+        for (int gpu = 0; gpu < devices_.size(); gpu++) {
+          threads.emplace_back( std::thread( [this] (int gpu) {
+            commBufferParams_[gpu]->copyFrom(singleCommBufferParams_);
+          }, gpu));
+        }
+        for (auto && t : threads) { t.join(); }
+
+        // Indicate that new values can be copied to communication buffers
+        for (int i = 0; i < commBuffersFilled_.size(); i++) { commBuffersFilled_[i] = false; }
+
+        // Clear comm buffer grads
+        Element(_1 = 0, singleCommBufferGrads_);
+
+      } while (true/*@TODO: Add stop condition*/);
+    });
+    #endif
+  }
+
   void launchCommOverlapThreads() {
     #if MPI_FOUND
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
@@ -1366,7 +1426,7 @@ private:
     #endif
   }
 
-  void shutDownCommOverlapThreads() {
+  void shutDownCommOverlapThreads() { // @TODO: Implement for single comm thread as well
     #if MPI_FOUND
     LOG(info)->info("Node {} about to shut down client communication threads", mpi_my_rank_);
     stopClientCommThreads_ = true;
@@ -1391,7 +1451,7 @@ private:
         launchServerShardThread();
       }
       if (commOverlap_) {
-        launchCommOverlapThreads();
+        if (singleCommOverlapThread_) { launchSingleCommOverlapThread(); } else { launchCommOverlapThreads(); }
       }
       first_ = false;
     }
@@ -1491,7 +1551,32 @@ private:
         cudaStreamSynchronize(0);
 
         // If communication channel ready, swap graph's pointers with secondary buffers
-        if (!commBuffersFilled_[my_id]) {
+        if (singleCommOverlapThread_ && !commBuffersFilled_[my_id]) {
+          boost::shared_lock<boost::shared_mutex> sharedLock(mutexCommBufferSynchronized_, boost::try_to_lock); // shared lock to allow multiple GPUs to synchronize simultaneously
+
+          if (sharedLock.owns_lock()) { // @TODO: This is duplicate code from below
+
+            // Copy summed grads to communication buffer
+            commBufferGrads_[my_id]->copyFrom(gpuSummedGrads_[my_id]);
+            // Copy parameters from communication buffer
+            graph->params()->vals()->copyFrom(commBufferParams_[my_id]);
+
+            // Notify communication thread that buffers have been read and filled
+            commBuffersFilled_[my_id] = true;
+            cvCommBufferSynchronized_.notify_one();
+
+            // Apply summed gradients to new parameters
+            localOptimizers_[my_id]->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
+            cudaStreamSynchronize(0);
+            // Clear summed gradients
+            Element(_1 = 0, gpuSummedGrads_[my_id]);
+            cudaStreamSynchronize(0);
+
+          }
+          //else { localOptimizers_[my_id]->update(graph->params()->vals(), gradients); }
+
+        }
+        else if (!singleCommOverlapThread_ && !commBuffersFilled_[my_id]) {
           std::unique_lock<std::mutex> tryLock(mutexCommBuffersFilled_[my_id], std::try_to_lock);
           if (tryLock.owns_lock()) {
             //LOG(info)->info("{},{} locked", mpi_my_rank_, my_id);
@@ -1505,13 +1590,16 @@ private:
             commBuffersFilled_[my_id] = true;
             cvCommBuffersFilled_[my_id].notify_one();
 
+            // Apply summed gradients to new parameters
+            localOptimizers_[my_id]->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
+            cudaStreamSynchronize(0);
             // Clear summed gradients
             Element(_1 = 0, gpuSummedGrads_[my_id]);
             cudaStreamSynchronize(0);
           }
-          else { localOptimizers_[my_id]->update(graph->params()->vals(), gradients); }
+          //else { localOptimizers_[my_id]->update(graph->params()->vals(), gradients); }
 
-        } else { localOptimizers_[my_id]->update(graph->params()->vals(), gradients); } // Local full optimizer
+        }// else { localOptimizers_[my_id]->update(graph->params()->vals(), gradients); } // Local full optimizer
 
       }
 
