@@ -886,6 +886,8 @@ private:
   // Computations/communication overlap variables
 
   bool commOverlap_{true}; // @TODO: Make this a run-time/config option
+  int maxNumberComputeIters_{0}; // Max number of compute iterations that a node can do per synchronisation @TODO: Make run-time option
+  std::vector<int> numberComputeIters_; // Current number of compute iterations of each client since last synchronisation
 
   bool commOverlapSingleActive_{false}; // Whether only one overlap thread can use communication channel at any time @TODO: Make run-time/config option
   std::mutex mutexCommChannel_; // Mutex to limit communication channel to one overlapping thread (if commOverlapSingleActive_ == true)
@@ -1283,11 +1285,6 @@ private:
       unsigned long messageInfo[3];
       {
         std::unique_lock<std::mutex> uniqueAccess = (optionalBlockMutex  == nullptr) ? std::unique_lock<std::mutex>() : std::unique_lock<std::mutex>(*optionalBlockMutex, std::try_to_lock); // Lock mutex if provided
-        if (uniqueAccess.owns_lock()) {
-          LOG(info)->info("{} {} owns lock", mpi_my_rank_, gpu);
-        } else {
-          LOG(info)->info("{} {} tried lock", mpi_my_rank_, gpu);
-        }
 
         // Send sparse grads to node
         messageInfo[SPARSE_INFO_SIZE_] = sparseSubNewGrads->size(); messageInfo[SPARSE_INFO_CLIENT_] = gpu; messageInfo[SPARSE_INFO_BATCHWORDS_] = batchWords;
@@ -1504,6 +1501,12 @@ private:
         Element(_1 = _1 + _2, gpuSummedGrads_[my_id], gradients);
         cudaStreamSynchronize(0);
 
+        // If reached max number of compute iterations per synchronisation, wait for communication channel to finish syncing
+        if (maxNumberComputeIters_ != 0 && ++numberComputeIters_[my_id] >= maxNumberComputeIters_) {
+          std::lock_guard<std::mutex> wait(mutexCommBuffersFilled_[my_id]);
+          numberComputeIters_[my_id] = 0;
+        }
+
         // If communication channel ready, swap graph's pointers with secondary buffers
         if (!commBuffersFilled_[my_id]) {
           std::unique_lock<std::mutex> tryLock(mutexCommBuffersFilled_[my_id], std::try_to_lock);
@@ -1525,6 +1528,8 @@ private:
             // Clear summed gradients
             Element(_1 = 0, gpuSummedGrads_[my_id]);
             cudaStreamSynchronize(0);
+
+            numberComputeIters_[my_id] = 0;
           }
           //else { LOG(info)->info("{},{} skipped lock", mpi_my_rank_, my_id); }
 
@@ -1550,7 +1555,8 @@ public:
         tau_{options_->get<size_t>("tau")},
         commBuffersFilled_(devices_.size(), false),
         mutexCommBuffersFilled_{devices_.size()},
-        cvCommBuffersFilled_{devices_.size()} {
+        cvCommBuffersFilled_{devices_.size()},
+        numberComputeIters_(devices_.size(), 0) {
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
