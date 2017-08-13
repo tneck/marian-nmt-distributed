@@ -1060,7 +1060,7 @@ private:
 
   void initRemoteCommunicator() {
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
-      size_t size = dropRate_ ? (nodeShardSizes_[mpi_my_rank_]  * 1.2 * (1.0 - dropRate_)) : nodeShardSizes_[mpi_my_rank_];
+      size_t size = dropRate_ ? (nodeShardSizes_[mpi_my_rank_]  * 1.2 * (1.0 - min(0.99, dropRate_))) : nodeShardSizes_[mpi_my_rank_];
       if (dropRate_) {
         clientShardSparseBuffer1_.push_back(std::vector<int>(size));
         clientShardSparseBuffer2_.push_back(std::vector<float>(size));
