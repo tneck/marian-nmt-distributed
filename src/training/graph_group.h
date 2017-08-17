@@ -885,7 +885,7 @@ private:
 
   // Computations/communication overlap variables
 
-  bool commOverlap_{true}; // @TODO: Make this a run-time/config option
+  bool commOverlap_{false}; // @TODO: Make this a run-time/config option
   int maxNumberComputeIters_{0}; // Max number of compute iterations that a node can do per synchronisation @TODO: Make run-time option
   std::vector<int> numberComputeIters_; // Current number of compute iterations of each client since last synchronisation
 
@@ -1090,8 +1090,14 @@ private:
     serverShardThread_ = new std::thread( [this] {
       MPI_Status status;
       do {
+        std::vector<std::chrono::time_point<std::chrono::system_clock>> timings;
+
         // Receive grads from any client
-        MPI_Recv(serverShardBuffer_.data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
+        timings.push_back(std::chrono::system_clock::now());
+        MPI_Probe(MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
+        timings.push_back(std::chrono::system_clock::now());
+        MPI_Recv(serverShardBuffer_.data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
+        timings.push_back(std::chrono::system_clock::now());
 
         // Update shard params asynchronously over GPUs
         std::vector<std::thread> threads;
@@ -1117,8 +1123,13 @@ private:
         }
         for (auto && t : threads) { t.join(); }
 
+        timings.push_back(std::chrono::system_clock::now());
+
         // Send updated params to same client
         MPI_Ssend(serverShardBuffer_.data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD);
+        timings.push_back(std::chrono::system_clock::now());
+
+        printTimings(timings, "server");
 
       } while (!stopServerShardThread_);
     });
@@ -1127,9 +1138,12 @@ private:
 
   void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr) {
     #if MPI_FOUND
+    std::vector<std::chrono::time_point<std::chrono::system_clock>> timings;
     size_t offset = 0;
     for (int node = 0; node < mpi_comm_world_size_; node++) {
       size_t nodeSize = nodeShardSizes_[node];
+
+      timings.push_back(std::chrono::system_clock::now());
 
       // Update remotely if node != this node
       if (node != mpi_my_rank_) {
@@ -1181,8 +1195,11 @@ private:
         for (auto && t : threads) { t.join(); }
       }
 
+      timings.push_back(std::chrono::system_clock::now());
+
       offset += nodeSize;
     }
+    printTimings(timings, "sync"+std::to_string(gpu));
     #endif
   }
 
@@ -1191,11 +1208,17 @@ private:
     serverShardThread_ = new std::thread( [this] {
       MPI_Status status;
       do {
+        std::vector<std::chrono::time_point<std::chrono::system_clock>> timings;
+
         // Receive sparse grads from any client
+        timings.push_back(std::chrono::system_clock::now());
         unsigned long messageInfo[3];
-        MPI_Recv(&messageInfo, 3, MPI_UNSIGNED_LONG, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD, &status);
+        MPI_Probe(MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD, &status);
+        timings.push_back(std::chrono::system_clock::now());
+        MPI_Recv(&messageInfo, 3, MPI_UNSIGNED_LONG, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD, &status);
         MPI_Recv(serverShardSparseBuffer1_.data(), serverShardSparseBuffer1_.size(), MPI_INT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         MPI_Recv(serverShardSparseBuffer2_.data(), serverShardSparseBuffer2_.size(), MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        timings.push_back(std::chrono::system_clock::now());
 
         std::vector<std::thread> threads;
         size_t offset = 0;
@@ -1255,12 +1278,16 @@ private:
         }
         for (auto && t : threads) { t.join(); }
 
+        timings.push_back(std::chrono::system_clock::now());
+
         // Send sparse deltas back to node
         messageInfo[SPARSE_INFO_SIZE_] = sparseDeltasOffset;
         MPI_Ssend(&messageInfo, 3, MPI_UNSIGNED_LONG, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD);
         MPI_Ssend(serverShardSparseBuffer1_.data(), messageInfo[SPARSE_INFO_SIZE_], MPI_INT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD);
         MPI_Ssend(serverShardSparseBuffer2_.data(), messageInfo[SPARSE_INFO_SIZE_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD);
+        timings.push_back(std::chrono::system_clock::now());
 
+        printTimings(timings, "server");
       } while (!stopServerShardThread_);
     });
     #endif
@@ -1269,7 +1296,11 @@ private:
   void sparseSynchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr) {
     #if MPI_FOUND
     size_t offset = 0;
+    std::vector<std::chrono::time_point<std::chrono::system_clock>> timings;
     for (int node = 0; node < mpi_comm_world_size_; node++) {
+
+      timings.push_back(std::chrono::system_clock::now());
+
       size_t nodeSize = nodeShardSizes_[node];
 
       // Split sparse grads for node
@@ -1320,7 +1351,10 @@ private:
       cudaStreamSynchronize(0);
 
       offset += nodeSize;
+
+      timings.push_back(std::chrono::system_clock::now());
     }
+    printTimings(timings, "sync"+std::to_string(gpu));
     #endif
   }
 
@@ -1329,11 +1363,15 @@ private:
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
       clientCommThreads_.emplace_back( new std::thread( [this] (int gpu) {
         do {
+          std::vector<std::chrono::time_point<std::chrono::system_clock>> timings;
+
           // Wait for GPU (client) to fill buffers pointers
+          timings.push_back(std::chrono::system_clock::now());
           std::unique_lock<std::mutex> uniqueLock(mutexCommBuffersFilled_[gpu]);
           while (!commBuffersFilled_[gpu]) {
             cvCommBuffersFilled_[gpu].wait(uniqueLock);
           }
+          timings.push_back(std::chrono::system_clock::now());
 
           // Synchronize with server shards
           if (dropRate_) {
@@ -1345,6 +1383,7 @@ private:
           // Indicate that buffers can be read from and filled again
           commBuffersFilled_[gpu] = false;
 
+          printTimings(timings, "overlap " + std::to_string(gpu));
         } while (!stopClientCommThreads_);
       }, gpu));
     }
@@ -1419,6 +1458,8 @@ private:
 
       thread_local size_t my_id = 0;
 
+      std::vector<std::chrono::time_point<std::chrono::system_clock>> timings;
+
       //LOG(info)->info("GPU {} STARTING COMPUTE", my_id);
 
       if(!graph) {
@@ -1430,9 +1471,12 @@ private:
 
       auto costNode = builder->build(graph, batch);
 
+      timings.push_back(std::chrono::system_clock::now());
       graph->forward();
+      timings.push_back(std::chrono::system_clock::now());
       float cost = costNode->scalar();
       graph->backward();
+      timings.push_back(std::chrono::system_clock::now());
 
       // Get batch stats
       size_t batchWords = batch->words();
@@ -1497,15 +1541,21 @@ private:
       // Overlapping computations with communication
       if (commOverlap_) {
 
+        timings.push_back(std::chrono::system_clock::now());
+
         // Add computed gradients to local running sum
         Element(_1 = _1 + _2, gpuSummedGrads_[my_id], gradients);
         cudaStreamSynchronize(0);
+
+        timings.push_back(std::chrono::system_clock::now());
 
         // If reached max number of compute iterations per synchronisation, wait for communication channel to finish syncing
         if (maxNumberComputeIters_ != 0 && ++numberComputeIters_[my_id] >= maxNumberComputeIters_) {
           std::lock_guard<std::mutex> wait(mutexCommBuffersFilled_[my_id]);
           numberComputeIters_[my_id] = 0;
         }
+
+        timings.push_back(std::chrono::system_clock::now());
 
         // If communication channel ready, swap graph's pointers with secondary buffers
         if (!commBuffersFilled_[my_id]) {
@@ -1530,6 +1580,8 @@ private:
             cudaStreamSynchronize(0);
 
             numberComputeIters_[my_id] = 0;
+
+            timings.push_back(std::chrono::system_clock::now());
           }
           //else { LOG(info)->info("{},{} skipped lock", mpi_my_rank_, my_id); }
 
@@ -1537,9 +1589,30 @@ private:
 
       }
 
+      printTimings(timings, "compute"+std::to_string(my_id));
+
     };
 
     pool_.enqueue(task, batch);
+  }
+
+  void printTimings(std::vector<std::chrono::time_point<std::chrono::system_clock>> &timePoints, std::string description) {
+    std::string timeString = "";
+    for (int i = 0; i < timePoints.size(); i++) {
+      auto timePointMs = std::chrono::time_point_cast<std::chrono::microseconds>(timePoints[i]);
+      std::time_t time = std::chrono::system_clock::to_time_t(timePointMs);
+
+      const std::tm * timetm = std::localtime(&time);
+
+      std::ostringstream s;
+      s << std::put_time(timetm, "%c %Z") << "+" << std::chrono::duration_cast<std::chrono::milliseconds>(timePointMs.time_since_epoch()).count() % 1000;
+      timeString += s.str() + ", ";
+
+      //char buffer[19];
+      //std::strftime(buffer, 19, "%Y-%m-%d %H:%M:%S", timetm);
+      //timeString += buffer; timeString += std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(timePointMs.time_since_epoch()).count() % 1000); timeString += ", ";
+    }
+    LOG(info)->info("{} | {}", description, timeString);
   }
 
 public:
