@@ -1383,7 +1383,7 @@ private:
           // Indicate that buffers can be read from and filled again
           commBuffersFilled_[gpu] = false;
 
-          printTimings(timings, "overlap " + std::to_string(gpu));
+          printTimings(timings, "overlap" + std::to_string(gpu));
         } while (!stopClientCommThreads_);
       }, gpu));
     }
