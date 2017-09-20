@@ -209,7 +209,9 @@ public:
     scheduler_ = scheduler;
     // optimizer has to be registered last to see a change of learning rate
     scheduler_->registerTrainingObserver(scheduler_);
-    scheduler_->registerTrainingObserver(opt_);
+
+    for(auto opt : shardOpt_)
+      scheduler_->registerTrainingObserver(opt);
   }
 
 private:
@@ -327,8 +329,6 @@ private:
             if(movingAvg_)
               updateMovingAverage(paramsAvg_[idx], params_[latestVersion][idx],
                                   scheduler_->numberOfBatches());
-
-            cudaStreamSynchronize(0);
           },
           idx,
           pos));
@@ -372,23 +372,18 @@ private:
                     tmpTensor[idx],
                     params_[latestVersion][idx],
                     params_[currVersion][idx]);
-            cudaStreamSynchronize(0);
 
             // get sparse delta
             fetchDropper[worker_id][idx]->dropGraph(
                 tmpTensor[idx], tmpSparseDelta[idx], drop_rate_);
-            cudaStreamSynchronize(0);
 
             // move sparse delta
             localSparseDelta[worker_id][idx]->copyFrom(tmpSparseDelta[idx]);
-            cudaStreamSynchronize(0);
 
             localSparseDelta[worker_id][idx]->scatterAdd(
                 oldParams->subtensor(pos, grads_[idx]->size()));
-            cudaStreamSynchronize(0);
 
             localVersionNumbers[worker_id][idx] = globalVersionNumber[idx];
-
           },
           i,
           p));
@@ -420,15 +415,12 @@ private:
               // split to shard
               SparseTensor subGrad
                   = newGrads->subtensor(pos, grads_[idx]->size(), idx);
-              cudaStreamSynchronize(0);
 
               // sent
               sparseGrads_[idx]->copyFrom(subGrad);
-              cudaStreamSynchronize(0);
 
               // convert back to dense, with index offset of -pos
               sparseGrads_[idx]->toDense(grads_[idx], -pos);
-              cudaStreamSynchronize(0);
 
               // apply and increment your version number
               int pastVersion = globalVersionNumber[idx] % history_size_;
@@ -445,7 +437,6 @@ private:
                                     params_[latestVersion][idx],
                                     scheduler_->numberOfBatches());
 
-              cudaStreamSynchronize(0);
             },
             idx,
             pos));
@@ -634,8 +625,6 @@ private:
       t++;
 
       if(t % tau_ == 0) {
-
-        cudaStreamSynchronize(0);
         if(drop_rate_) {
           dropper->dropGraph(
               gradients, localSparseGrads_[my_id], drop_rate_);
