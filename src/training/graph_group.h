@@ -762,6 +762,9 @@ public:
   }
 };
 
+/**
+ * @brief Multi-node graph group for asynchronous training over multiple machines each with one or multiple GPUs
+ */
 template <class Builder>
 class MultiNodeAsyncGraphGroup : public GraphGroup {
 public:
@@ -772,16 +775,15 @@ public:
     scheduler_ = scheduler;
     // optimizer has to be registered last to see a change of learning rate
     scheduler_->registerTrainingObserver(scheduler_);
-    scheduler_->registerTrainingObserver(opt_);
+
+    for (auto opt : gpuShardsOpts_) {
+      scheduler_->registerTrainingObserver(opt);
+    }
   }
 
 private:
 
-  /*
-   *
-   * Node local variables copied from AsyncGraphGroup
-   *
-   */
+  // Variables directly inherited from AsyncGraphGroup
 
   bool first_{true};
 
@@ -791,7 +793,7 @@ private:
 
   Ptr<Scheduler<dataset_type>> scheduler_;
 
-  std::mutex sync_;
+  std::mutex mutexClientInit_;
 
   boost::shared_mutex schedulerMutex_;
 
@@ -802,15 +804,9 @@ private:
 
   ThreadPool pool_;
 
-  std::vector<Ptr<TensorAllocator>> allocators;
+  std::vector<Ptr<TensorAllocator>> allocators_;
 
   size_t tau_{1};
-
-  /*
-   *
-   * Node distribution variables (new)
-   *
-   */
 
   size_t batchIter_ = 0; // For dividing batches amongst nodes
 
@@ -894,56 +890,77 @@ private:
   std::vector<std::mutex> mutexCommBuffersFilled_;
   std::vector<std::condition_variable> cvCommBuffersFilled_;
 
-  /*
+  /**
+   * @brief Allocate new tensor on given GPU and store allocator
    *
-   * Node local methods copied from AsyncGraphGroup
-   *
+   * @param size Number of floats to allocate
+   * @param device GPU
+   * @return Allocated tensor
    */
-
   Tensor newTensor(int size, int device) {
     Tensor t;
-    Ptr<TensorAllocator> allocator_ = New<TensorAllocator>(device);
-    allocator_->reserveExact(size * sizeof(float));
-    allocator_->allocate(t, {1, size});
-    allocators.push_back(allocator_);
-
+    Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
+    allocator->reserveExact(size * sizeof(float));
+    allocator->allocate(t, {1, size});
+    allocators_.push_back(allocator);
     return t;
   }
 
-  // Mostly extracted from original 'execute(batch)' method
+  /**
+   * @brief Initialize graphs and variables for MPI, remote communicator, server shard, sparse communication
+   * and overlapping compute/communicate, and launch server and client communication threads
+   *
+   * @param batch Batch to build initial graph with
+   */
   void initFirstRun(Ptr<data::Batch> batch) {
-    // initialize the parameters
+    // Initialize client graphs (incl. params) and builders
     for(size_t i = 0; i < graphs_.size(); ++i) {
-      // takes care of thead_local stuff
-      THREAD_GUARD(builders_[i]->build(graphs_[i], batch);
-                       graphs_[i]->forward(););
+      THREAD_GUARD(
+          builders_[i]->build(graphs_[i], batch);
+          graphs_[i]->forward();
+      );
     }
     cudaStreamSynchronize(0);
+    // Initialize MPI variables for inter-node communication
+    initMPI();
+    // Initialize variables for server shard
+    initServerShard();
+    // Initialize client variables for inter-node communication
+    initRemoteCommunicationVars();
+    // Initialize sparse server shard variables and launch server thread if sparse communication enabled
+    if (dropRate_) {
+      //initServerShardSparseVars();
+      launchSparseServerShardThread();
+    } else {
+      launchServerShardThread();
+    }
+    // Launch compute/communicate overlap threads if enabled
+    if (commOverlap_) {
+      launchCommOverlapThreads();
+    }
   }
 
-  /*
-   *
-   * Node distribution methods
-   *
+  /**
+   * @brief Initialize variables relevant to MPI, i.e. size of cluster and rank of this node
    */
-
   void initMPI() {
     #if MPI_FOUND
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_comm_world_size_);
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_my_rank_);
     #endif
   }
-
+  
+  /**
+   * @brief Initialize server shard, i.e. sizes, parameters, gradients and buffers
+   */
   void initServerShard() {
     // Initialize server shard sizes for all nodes (remote + current)
     size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
     size_t nodeShardSize = ceilf(((float) totalParamsGradsSize) / mpi_comm_world_size_);
     size_t remainingTotalSize = totalParamsGradsSize;
-
     for (int node = 0; node < mpi_comm_world_size_; node++) {
-      size_t size = min(nodeShardSize, remainingTotalSize);
+      size_t size = std::min(nodeShardSize, remainingTotalSize);
       nodeShardSizes_.push_back(size);
-      //LOG(info)->info("{} assigning node {} size {}", mpi_my_rank_, node, size);
       remainingTotalSize -= size;
     }
 
@@ -952,64 +969,81 @@ private:
     size_t gpuShardSize = ceilf(((float) thisNodeSize) / devices_.size());
     size_t offset = 0;
 
-    if (dropRate_) {
-      setupNumberClientsOfNodes();
-      setupClientSizesOfNodes();
-    }
-    int sparseCap = totalParamsGradsSize * 1.2 * (1.0 - dropRate_);
-
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
-      size_t size = min(gpuShardSize, thisNodeSize - offset);
-
+      size_t size = std::min(gpuShardSize, thisNodeSize - offset);
       Tensor gpuParams = newTensor(size, devices_[gpu]);
       gpuParams->copyFrom(graphs_[0]->params()->vals()->subtensor(offset, size));
       gpuShardsParams_.push_back(gpuParams);
       gpuShardsGrads_.push_back(newTensor(size, devices_[gpu]));
       gpuShardSizes_.push_back(size);
-
-      if (dropRate_) {
-        tmpDeltas_.push_back(newTensor(size, devices_[gpu]));
-
-        // Server side
-        shardSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu]))); // @TODO: Sparse sizes can be optimised further
-        tmpSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu])));
-        // Client side @TODO: Move local things to new function (e.g. initFirstBatch())
-        localSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu]))); // full before subtensor
-        localSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu]))); // subtensor over nodes
-
-        // Initialize parameters communicated with all clients of this GPU shard (to compute deltas) + gradient droppers @TODO: Move droppers stuff to new function as well
-        std::vector<std::vector<Tensor>> clientParams;
-        std::vector<std::vector<GradientDrop>> clientDroppers;
-        std::vector<GradientDrop> shardDroppers;
-        for (int node = 0; node < mpi_comm_world_size_; node++) {
-          std::vector<Tensor> nodeParams;
-          std::vector<GradientDrop> nodeDroppers;
-          int nClients = numberClientsOfNodes_[node];
-          for (int client = 0; client < nClients; client++) {
-            Tensor clientTensor = newTensor(size, devices_[gpu]);
-            clientTensor->copyFrom(gpuParams); // copy initial shard params into tensor
-            nodeParams.push_back(clientTensor);
-            nodeDroppers.push_back(GradientDrop(new GradientDropBase()));
-          }
-          clientParams.push_back(nodeParams);
-          clientDroppers.push_back(nodeDroppers);
-          shardDroppers.push_back(GradientDrop(new GradientDropBase()));
-        }
-        clientsParams_.push_back(clientParams);
-        fetchDroppers_.push_back(clientDroppers); // fetchDroppers_[shard][node][client]
-        gradientDroppers_.push_back(shardDroppers);
-      }
       offset += size;
     }
-    // Initialize send/receive buffers
-    if (dropRate_) {
-      serverShardSparseBuffer1_ = std::vector<int>(nodeShardSizes_[mpi_my_rank_]); // @ TODO: Should actually be sparse(X) instead of X but this causes very sporadic crashes
-      serverShardSparseBuffer2_ = std::vector<float>(nodeShardSizes_[mpi_my_rank_]);
-    } else {
+
+    // Initialize full send/receive buffer (if no sparse communication)
+    if (!dropRate_) {
       serverShardBuffer_ = std::vector<float>(nodeShardSizes_[mpi_my_rank_]);
     }
   }
 
+  /**
+   * @brief Initialize sparse variables for server shards, i.e. number and sizes of clients of every node, relevant sparse variables and send/receive buffers @TODO: Further clean-up
+   */
+  void initServerShardSparseVars() {
+    // Initialize number and sizes of clients of every node in cluster
+    setupNumberClientsOfNodes();
+    setupClientSizesOfNodes();
+
+    // Initialize last communicated parameters and delta buffers for all clients of this shard
+
+    size_t thisNodeSize = nodeShardSizes_[mpi_my_rank_];
+    size_t gpuShardSize = ceilf(((float) thisNodeSize) / devices_.size());
+    size_t offset = 0;
+
+    for (int gpu = 0; gpu < devices_.size(); gpu++) {
+      size_t size = std::min(gpuShardSize, thisNodeSize - offset);
+
+      tmpDeltas_.push_back(newTensor(size, devices_[gpu]));
+      int sparseCap = graphs_[0]->params()->vals()->size() * 1.2 * (1.0 - dropRate_); // (Estimated) Max size of sparse buffers
+
+      // Server side
+      shardSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu]))); // @TODO: Sparse sizes can be optimised further
+      tmpSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu])));
+      // Client side
+      localSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu])));
+      localSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, devices_[gpu])));
+
+      // Initialize parameters communicated with all external clients of this server shard (to compute deltas) + gradient droppers
+      std::vector<std::vector<Tensor>> extClientParams; // parameters stored for external clients
+      std::vector<std::vector<GradientDrop>> extClientDroppers;
+      std::vector<GradientDrop> shardDroppers;
+      for (int node = 0; node < mpi_comm_world_size_; node++) {
+        std::vector<Tensor> nodeParams;
+        std::vector<GradientDrop> nodeDroppers;
+        for (int client = 0; client < numberClientsOfNodes_[node]; client++) {
+          Tensor clientTensor = newTensor(size, devices_[gpu]);
+          clientTensor->copyFrom(graphs_[0]->params()->vals()->subtensor(offset, size)); // Copy initial shard params into tensor
+          nodeParams.push_back(clientTensor);
+          nodeDroppers.push_back(GradientDrop(new GradientDropBase()));
+        }
+        extClientParams.push_back(nodeParams);
+        extClientDroppers.push_back(nodeDroppers);
+        shardDroppers.push_back(GradientDrop(new GradientDropBase()));
+      }
+      clientsParams_.push_back(extClientParams);
+      fetchDroppers_.push_back(extClientDroppers); // fetchDroppers_[shard][node][client]
+      gradientDroppers_.push_back(shardDroppers);
+
+      offset += size;
+    }
+
+    // Initialize send/receive buffers
+    serverShardSparseBuffer1_ = std::vector<int>(nodeShardSizes_[mpi_my_rank_]); // @ TODO: Should actually be sparse(X) instead of X but this causes very sporadic crashes
+    serverShardSparseBuffer2_ = std::vector<float>(nodeShardSizes_[mpi_my_rank_]);
+  }
+
+  /**
+   * @brief Get number of clients of every node by communicating with all nodes in cluster @TODO: Communication will not be necessary once run-time option is implemented
+   */
   void setupNumberClientsOfNodes() {
     numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_);
     if (mpi_my_rank_ == 0) { // First node gathers and distributes nClients
@@ -1029,6 +1063,9 @@ private:
     }
   }
 
+  /**
+   * @brief Determine size for all clients of every node
+   */
   void setupClientSizesOfNodes() {
     for (int node = 0; node < mpi_comm_world_size_; node++) {
       std::string s = "Node "; s += std::to_string(node) + " parameter sharding: ";
@@ -1047,7 +1084,10 @@ private:
     }
   }
 
-  void initRemoteCommunicator() {
+  /**
+   * @brief Initialize client buffers for remote communication (synchronisation)
+   */
+  void initRemoteCommunicationVars() { // @TODO: Integrate with clients / drop-rate / comm-overlap
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
       size_t size = dropRate_ ? (nodeShardSizes_[mpi_my_rank_]  * 3 * (1.0 - min(0.99, dropRate_))) : nodeShardSizes_[mpi_my_rank_];
       if (dropRate_) {
@@ -1074,6 +1114,9 @@ private:
     }
   }
 
+  /*
+   * @brief Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters
+   */
   void launchServerShardThread() {
     #if MPI_FOUND
     serverShardThread_ = new std::thread( [this] {
@@ -1114,6 +1157,15 @@ private:
     #endif
   }
 
+  /**
+   * @brief Send new gradients to the server shards and receive the updated (global) parameters
+   *
+   * @param newGrads Gradients to send
+   * @param oldParams Parameters to replace
+   * @param gpu GPU/client performing synchronize (to access appropriate buffers etc.)
+   * @param batchWords Number of batch words to pass to server shard optimizers
+   * @param optionalBlockMutex Optional mutex that has to be locked during synchronization
+   */
   void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr) {
     #if MPI_FOUND
     size_t offset = 0;
@@ -1175,6 +1227,10 @@ private:
     #endif
   }
 
+  /*
+   * @brief Launch independent thread which continually receives sparse gradients assigned to this shard from any client,
+   * runs the shard optimizer and sends back sparse deltas given the updated parameters (sparse communication)
+   */
   void launchSparseServerShardThread() {
     #if MPI_FOUND
     serverShardThread_ = new std::thread( [this] {
@@ -1255,6 +1311,15 @@ private:
     #endif
   }
 
+  /**
+   * @brief Send new sparse gradients to the server shards, receive sparse deltas and apply these to the parameters to get the updated (global) parameters
+   *
+   * @param newGrads Gradients to send sparsely
+   * @param oldParams Parameters to update with deltas
+   * @param gpu GPU/client performing synchronize (to access appropriate buffers etc.)
+   * @param batchWords Number of batch words to pass to server shard optimizers
+   * @param optionalBlockMutex Optional mutex that has to be locked during synchronization
+   */
   void sparseSynchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr) {
     #if MPI_FOUND
     size_t offset = 0;
@@ -1313,6 +1378,9 @@ private:
     #endif
   }
 
+  /**
+   * @brief Launch independent threads which continually synchronize their client's gradients/parameters whenever the respective communication buffers are full
+   */
   void launchCommOverlapThreads() {
     #if MPI_FOUND
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
@@ -1340,6 +1408,9 @@ private:
     #endif
   }
 
+  /**
+   * @brief Safely shut down the launched server shard thread
+   */
   void shutDownServerShardThread() { // @TODO: Test if this works properly
     #if MPI_FOUND
     LOG(info)->info("Node {} about to shut down server thread", mpi_my_rank_);
@@ -1366,6 +1437,9 @@ private:
     #endif
   }
 
+  /**
+   * @brief Safely shut down the launched communication overlap threads
+   */
   void shutDownCommOverlapThreads() {
     #if MPI_FOUND
     LOG(info)->info("Node {} about to shut down client communication threads", mpi_my_rank_);
@@ -1379,20 +1453,15 @@ private:
     #endif
   }
 
+  /**
+   * @brief Execute given batch on this node, pushing/pulling the resulting gradients/parameters to/from the server shards
+   * or -- if comm. overlap enabled -- to/from the communication buffers, summing gradients locally if the communication thread is busy
+   *
+   * @param batch Batch on which to perform forward and backward passes
+   */
   void execute(Ptr<data::Batch> batch) {
     if(first_) {
       initFirstRun(batch);
-      initMPI();
-      initServerShard();
-      initRemoteCommunicator();
-      if (dropRate_) {
-        launchSparseServerShardThread();
-      } else {
-        launchServerShardThread();
-      }
-      if (commOverlap_) {
-        launchCommOverlapThreads();
-      }
       first_ = false;
     }
 
@@ -1411,7 +1480,7 @@ private:
       //LOG(info)->info("GPU {} STARTING COMPUTE", my_id);
 
       if(!graph) {
-        std::lock_guard<std::mutex> lock(sync_);
+        std::lock_guard<std::mutex> lock(mutexClientInit_);
         my_id = i;
         graph = graphs_[i];
         builder = builders_[i++];
@@ -1532,6 +1601,10 @@ private:
   }
 
 public:
+
+  /**
+   * @brief (Constructor) Configure settings and initialize graphs, shard optimizers, local optimizers, graph builders, etc. and their associated variables
+   */
   template <class... Args>
   MultiNodeAsyncGraphGroup(Ptr<Config> options, Args... args)
       : GraphGroup(options),
@@ -1557,11 +1630,19 @@ public:
     }
   }
 
+  /**
+   * @brief (Destructor) Shut down server shard thread and (if comm. overlap enabled) communication overlap threads
+   */
   ~MultiNodeAsyncGraphGroup() {
     if (commOverlap_) { shutDownCommOverlapThreads(); } // Order is important, this needs to run before server threads are shut down
     shutDownServerShardThread();
   }
 
+  /**
+   * @brief Update any client model with given batch if batch is assigned to this node
+   *
+   * @param batch Batch to use in update
+   */
   void update(Ptr<data::Batch> batch) {
     if (batchIter_ % mpi_comm_world_size_ == mpi_my_rank_) { // Only take batch assigned to this node (@INFO: Changing seed randomizer across nodes instead of this gives worse results)
       execute(batch);
@@ -1569,6 +1650,9 @@ public:
     batchIter_++;
   }
 
+  /**
+   * @brief Load models from disk if file exists and setting is not disabled
+   */
   void load() {
     if(!options_->get<bool>("no-reload")) {
       std::string init = options_->get<std::string>("model");
@@ -1582,8 +1666,18 @@ public:
     }
   }
 
+  /**
+   * @brief Save model of first client's graph to disk
+   *
+   * @param final Whether this is the final save
+   */
   void save(bool final = false) { save(graphs_[0], final); }
 
+  /**
+   * @brief Save model of given graph to disk
+   *
+   * @param final Whether this is the final save
+   */
   void save(Ptr<ExpressionGraph> graph, bool final = false) {
     int idx = 0;
     for(int i = 0; i < graphs_.size(); ++i) {
@@ -1618,6 +1712,11 @@ public:
     }
   }
 
+  /**
+   * @brief Collect statistics from first client's graph
+   *
+   * @return Statisticsi of first client's graph
+   */
   Ptr<data::BatchStats> collectStats() {
     return builders_[0]->collectStats(graphs_[0]);
   }
