@@ -402,6 +402,21 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
   desc.add(training);
 }
 
+void ConfigParser::addOptionsMultiNodeTraining(po::options_description& desc) {
+  po::options_description multinodetraining("Multi-node training options", guess_terminal_width());
+  // clang-format off
+  multinodetraining.add_options()
+    ("compute-comm-overlap", po::value<bool>()->zero_tokens()->default_value(true),
+    "Overlap model computations with communication")
+    ("max-num-compute-iters", po::value<int>()->default_value(0),
+    "Max number of compute iterations for every parameter synchronization")
+    ("multi-node-devices", po::value<std::vector<int>>()->multitoken()->default_value(std::vector<int>({0}), "0"),
+     "GPUs on each node to use for training")
+  ;
+  // clang-format on
+  desc.add(multinodetraining);
+}
+
 void ConfigParser::addOptionsValid(po::options_description& desc) {
   po::options_description valid("Validation set options",
                                 guess_terminal_width());
