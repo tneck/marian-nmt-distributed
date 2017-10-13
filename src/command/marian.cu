@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
   }
   #endif
 
-  if (comm_world_size > 1) {
+  if (true || comm_world_size > 1) {
     if (suitable_thread_mode) {
       LOG(info)->info("Launching Multi-Node Asynchronous Graph Group");
       WrapModelType<Train, MultiNodeAsyncGraphGroup>(options)->run();
