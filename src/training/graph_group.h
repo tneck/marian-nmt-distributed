@@ -929,7 +929,7 @@ private:
     initRemoteCommunicationVars();
     // Initialize sparse server shard variables and launch server thread if sparse communication enabled
     if (dropRate_) {
-      //initServerShardSparseVars();
+      initServerShardSparseVars();
       launchSparseServerShardThread();
     } else {
       launchServerShardThread();
