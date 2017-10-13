@@ -884,6 +884,8 @@ private:
   std::vector<Tensor> commBufferGrads_;
 
   std::vector<Tensor> gpuSummedGrads_;
+  std::vector<size_t> gpuSummedWordCounts_;
+  std::vector<size_t> gpuCommittedWordCounts_;
   std::vector<Ptr<OptimizerBase>> localOpts_;
 
   std::vector<bool> commBuffersFilled_;
@@ -949,7 +951,7 @@ private:
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_my_rank_);
     #endif
   }
-  
+
   /**
    * @brief Initialize server shard, i.e. sizes, parameters, gradients and buffers
    */
@@ -1116,6 +1118,7 @@ private:
 
   /*
    * @brief Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters
+   * @TODO: Implement batch-flexible-lr in non-sparse by sending messageInfo through MPI with number of batch words
    */
   void launchServerShardThread() {
     #if MPI_FOUND
@@ -1143,7 +1146,7 @@ private:
             // Copy params from GPU
             cudaMemcpy(&serverShardBuffer_.at(offset), gpuShardsParams_[gpu]->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
             cudaStreamSynchronize(0);
-            }, gpu, offset, size));
+          }, gpu, offset, size));
 
           offset += size;
         }
@@ -1207,8 +1210,8 @@ private:
             // Copy grads to appropriate GPU
             gpuShardsGrads_[gpu]->copyFrom(newGrads->subtensor(offset, size));
             // Run optimizer on GPU
-            if (scale_lr) {
-              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], average_batch_words);
+            if (scale_lr && batchWords > 0) {
+              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords / average_batch_words);
             } else {
               gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
             }
@@ -1264,7 +1267,7 @@ private:
 
             // Run optimizer on GPU
             if (scale_lr && batchWords > 0) {
-              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords);
+              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords / average_batch_words);
             } else {
               gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
             }
@@ -1342,6 +1345,7 @@ private:
 
         // Send sparse grads to node
         messageInfo[SPARSE_INFO_SIZE_] = sparseSubNewGrads->size(); messageInfo[SPARSE_INFO_CLIENT_] = gpu; messageInfo[SPARSE_INFO_BATCHWORDS_] = batchWords;
+
         MPI_Ssend(&messageInfo, 3, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
         MPI_Ssend(clientShardSparseBuffer1_[gpu].data(), messageInfo[SPARSE_INFO_SIZE_], MPI_INT, node, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
         MPI_Ssend(clientShardSparseBuffer2_[gpu].data(), messageInfo[SPARSE_INFO_SIZE_], MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);
@@ -1394,9 +1398,9 @@ private:
 
           // Synchronize with server shards
           if (dropRate_) {
-            sparseSynchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
+            sparseSynchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, scale_lr ? gpuCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
           } else {
-            synchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
+            synchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, scale_lr ? gpuCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
           }
 
           // Indicate that buffers can be read from and filled again
@@ -1477,8 +1481,6 @@ private:
 
       thread_local size_t my_id = 0;
 
-      //LOG(info)->info("GPU {} STARTING COMPUTE", my_id);
-
       if(!graph) {
         std::lock_guard<std::mutex> lock(mutexClientInit_);
         my_id = i;
@@ -1558,6 +1560,10 @@ private:
         // Add computed gradients to local running sum
         Element(_1 = _1 + _2, gpuSummedGrads_[my_id], gradients);
         cudaStreamSynchronize(0);
+        // Sum up word counts if batch flexible learning rate is enabled
+        if (scale_lr) {
+          gpuSummedWordCounts_[my_id] += numSeenWords;
+        }
 
         // If reached max number of compute iterations per synchronisation, wait for communication channel to finish syncing
         if (maxNumberComputeIters_ != 0 && ++numberComputeIters_[my_id] >= maxNumberComputeIters_) {
@@ -1569,12 +1575,17 @@ private:
         if (!commBuffersFilled_[my_id]) {
           std::unique_lock<std::mutex> tryLock(mutexCommBuffersFilled_[my_id], std::try_to_lock);
           if (tryLock.owns_lock()) {
-            //LOG(info)->info("{},{} locked", mpi_my_rank_, my_id);
 
             // Copy summed grads to communication buffer
             commBufferGrads_[my_id]->copyFrom(gpuSummedGrads_[my_id]);
             // Copy parameters from communication buffer
             graph->params()->vals()->copyFrom(commBufferParams_[my_id]);
+
+            // Commit summed word counts if batch-flexible-lr enabled
+            if (scale_lr) {
+              gpuCommittedWordCounts_[my_id] = gpuSummedWordCounts_[my_id];
+              gpuSummedWordCounts_[my_id] = 0;
+            }
 
             // Notify communication thread that buffers have been read and filled
             commBuffersFilled_[my_id] = true;
@@ -1589,9 +1600,8 @@ private:
 
             numberComputeIters_[my_id] = 0;
           }
-          //else { LOG(info)->info("{},{} skipped lock", mpi_my_rank_, my_id); }
 
-        } //else { LOG(info)->info("{},{} skipped lock", mpi_my_rank_, my_id); }
+        }
 
       }
 
@@ -1615,6 +1625,8 @@ public:
         mvDecay_{(float)options_->get<double>("moving-decay")},
         dropRate_{options_->get<double>("drop-rate")},
         tau_{options_->get<size_t>("tau")},
+        gpuSummedWordCounts_(devices_.size(), 0),
+        gpuCommittedWordCounts_(devices_.size(), 0),
         commBuffersFilled_(devices_.size(), false),
         mutexCommBuffersFilled_{devices_.size()},
         cvCommBuffersFilled_{devices_.size()},
