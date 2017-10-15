@@ -397,6 +397,8 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
       ->zero_tokens()
       ->default_value(false),
      "Fix target embeddings. Affects all decoders")
+    ("multi-node", po::value<bool>()->default_value(false),
+    "Enable multi-noded training")
   ;
   // clang-format on
   desc.add(training);
@@ -406,12 +408,16 @@ void ConfigParser::addOptionsMultiNodeTraining(po::options_description& desc) {
   po::options_description multinodetraining("Multi-node training options", guess_terminal_width());
   // clang-format off
   multinodetraining.add_options()
-    ("compute-comm-overlap", po::value<bool>()->zero_tokens()->default_value(true),
-    "Overlap model computations with communication")
-    ("max-num-compute-iters", po::value<int>()->default_value(0),
-    "Max number of compute iterations for every parameter synchronization")
     ("multi-node-devices", po::value<std::vector<int>>()->multitoken()->default_value(std::vector<int>({0}), "0"),
      "GPUs on each node to use for training")
+    ("multi-node-drop-rate", po::value<double>()->default_value(0.99),
+     "Gradient/parameter drop rate")
+    ("multi-node-overlap", po::value<bool>()->default_value(true),
+     "Overlap model computations with communication")
+    ("multi-node-single-comm", po::value<bool>()->default_value(false),
+     "Only allow one overlapping thread to send/receive data at any one time")
+    ("multi-node-max-compute", po::value<int>()->default_value(-1),
+     "Max number of compute iterations for every parameter synchronization")
   ;
   // clang-format on
   desc.add(multinodetraining);
@@ -546,6 +552,7 @@ void ConfigParser::parseOptions(
       break;
     case ConfigMode::training:
       addOptionsTraining(cmdline_options_);
+      addOptionsMultiNodeTraining(cmdline_options_); // @TODO: Only call if multi-node enabled
       addOptionsValid(cmdline_options_);
       break;
   }
@@ -671,6 +678,14 @@ void ConfigParser::parseOptions(
     SET_OPTION("embedding-normalization", bool);
     SET_OPTION("embedding-fix-src", bool);
     SET_OPTION("embedding-fix-trg", bool);
+
+    SET_OPTION("multi-node", bool);
+    // Multi-node @TODO: Only set if multi-node enabled
+    SET_OPTION("multi-node-devices", std::vector<int>);
+    SET_OPTION("multi-node-drop-rate", double);
+    SET_OPTION("multi-node-overlap", bool);
+    SET_OPTION("multi-node-single-comm", bool);
+    SET_OPTION("multi-node-max-compute", int);
   }
   if(mode_ == ConfigMode::rescoring) {
     SET_OPTION("no-reload", bool);

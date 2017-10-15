@@ -802,7 +802,7 @@ private:
   bool movingAvg_{false};
   float mvDecay_{0.9999};
 
-  ThreadPool pool_;
+  ThreadPool * pool_;
 
   std::vector<Ptr<TensorAllocator>> allocators_;
 
@@ -843,9 +843,11 @@ private:
   std::vector<size_t> nodeShardSizes_;
   std::vector<size_t> gpuShardSizes_;
 
+  std::vector<size_t> multiNodeDevices_;
+
   // Sparse communication variables
 
-  double dropRate_{0};
+  double dropRate_;
 
   static const int SPARSE_INFO_SIZE_{0}, SPARSE_INFO_CLIENT_{1}, SPARSE_INFO_BATCHWORDS_{2};
 
@@ -862,19 +864,19 @@ private:
   std::vector<SparseTensor> localSparseGrads_;
   std::vector<SparseTensor> shardSparseGrads_;
   std::vector<SparseTensor> tmpSparseDeltas_;
-  std::vector<SparseTensor> localSparseDeltas_; // => localSparseDeltas_[gpu]
+  std::vector<SparseTensor> localSparseDeltas_;
 
   std::vector<std::vector<std::vector<GradientDrop>>> fetchDroppers_; // => fetchDroppers_[shard][node][client]
   std::vector<std::vector<GradientDrop>> gradientDroppers_; // => gradientDroppers_[gpu][node]
-  std::vector<Tensor> tmpDeltas_; // => tmpDeltas_[gpu]
+  std::vector<Tensor> tmpDeltas_;
 
   // Computations/communication overlap variables
 
-  bool commOverlap_{true}; // @TODO: Make this a run-time/config option
-  int maxNumberComputeIters_{0}; // Max number of compute iterations that a node can do per synchronisation @TODO: Make run-time option
-  std::vector<int> numberComputeIters_; // Current number of compute iterations of each client since last synchronisation
+  bool commOverlap_; // Overlapping computation during communication
+  int maxNumberComputeIters_; // Max number of compute iterations that a node can do per synchronisation
+  std::vector<size_t> numberComputeIters_; // Current number of compute iterations of each client since last synchronisation
 
-  bool commOverlapSingleActive_{false}; // Whether only one overlap thread can use communication channel at any time @TODO: Make run-time/config option
+  bool commOverlapSingleActive_; // Whether only one overlap thread can use communication channel at any time
   std::mutex mutexCommChannel_; // Mutex to limit communication channel to one overlapping thread (if commOverlapSingleActive_ == true)
 
   std::vector<std::thread*> clientCommThreads_;
@@ -991,8 +993,7 @@ private:
    * @brief Initialize sparse variables for server shards, i.e. number and sizes of clients of every node, relevant sparse variables and send/receive buffers @TODO: Further clean-up
    */
   void initServerShardSparseVars() {
-    // Initialize number and sizes of clients of every node in cluster
-    setupNumberClientsOfNodes();
+    // Initialize sizes of clients of every node in cluster
     setupClientSizesOfNodes();
 
     // Initialize last communicated parameters and delta buffers for all clients of this shard
@@ -1046,23 +1047,40 @@ private:
   /**
    * @brief Get number of clients of every node by communicating with all nodes in cluster @TODO: Communication will not be necessary once run-time option is implemented
    */
-  void setupNumberClientsOfNodes() {
-    numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_);
-    if (mpi_my_rank_ == 0) { // First node gathers and distributes nClients
-      numberClientsOfNodes_[0] = devices_.size(); // Set own number of clients
-      // Receive number of clients from each node
-      for (int node = 1; node < mpi_comm_world_size_; node++) {
-        MPI_Recv(&numberClientsOfNodes_[node], 1, MPI_INT, node, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  void setupClientsOfNodesAndDevices() {
+    int index = 0, node = 0, nClientsSeen = 0;
+    numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_, 0);
+    while (index < multiNodeDevices_.size()) {
+      if (numberClientsOfNodes_[node] == 0) {
+        numberClientsOfNodes_[node] = multiNodeDevices_[index];
+        nClientsSeen = 0;
+      } else if (nClientsSeen < numberClientsOfNodes_[node]) {
+        nClientsSeen++;
+        if (node == mpi_my_rank_) {
+          devices_.push_back(multiNodeDevices_[index]);
+        }
+      } else {
+        node++;
+        index--;
       }
-      // Send to each node the number of clients for all nodes
-      for (int node = 1; node < mpi_comm_world_size_; node++) {
-        MPI_Ssend(numberClientsOfNodes_.data(), mpi_comm_world_size_, MPI_INT, node, 0, MPI_COMM_WORLD);
-      }
-    } else { // All other nodes send local number of clients and receive numberClientsOfNodes_
-      int nLocalClients = devices_.size(); // Set own number of clients
-      MPI_Ssend(&nLocalClients, 1, MPI_INT, 0, 0, MPI_COMM_WORLD); // Send to node 0 ("master")
-      MPI_Recv(numberClientsOfNodes_.data(), mpi_comm_world_size_, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE); // Receive numberClientsOfNodes_
+      index++;
     }
+//    numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_);
+//    if (mpi_my_rank_ == 0) { // First node gathers and distributes nClients
+//      numberClientsOfNodes_[0] = devices_.size(); // Set own number of clients
+//      // Receive number of clients from each node
+//      for (int node = 1; node < mpi_comm_world_size_; node++) {
+//        MPI_Recv(&numberClientsOfNodes_[node], 1, MPI_INT, node, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+//      }
+//      // Send to each node the number of clients for all nodes
+//      for (int node = 1; node < mpi_comm_world_size_; node++) {
+//        MPI_Ssend(numberClientsOfNodes_.data(), mpi_comm_world_size_, MPI_INT, node, 0, MPI_COMM_WORLD);
+//      }
+//    } else { // All other nodes send local number of clients and receive numberClientsOfNodes_
+//      int nLocalClients = devices_.size(); // Set own number of clients
+//      MPI_Ssend(&nLocalClients, 1, MPI_INT, 0, 0, MPI_COMM_WORLD); // Send to node 0 ("master")
+//      MPI_Recv(numberClientsOfNodes_.data(), mpi_comm_world_size_, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE); // Receive numberClientsOfNodes_
+//    }
   }
 
   /**
@@ -1566,7 +1584,7 @@ private:
         }
 
         // If reached max number of compute iterations per synchronisation, wait for communication channel to finish syncing
-        if (maxNumberComputeIters_ != 0 && ++numberComputeIters_[my_id] >= maxNumberComputeIters_) {
+        if (maxNumberComputeIters_ != -1 && ++numberComputeIters_[my_id] >= maxNumberComputeIters_) {
           std::lock_guard<std::mutex> wait(mutexCommBuffersFilled_[my_id]);
           numberComputeIters_[my_id] = 0;
         }
@@ -1607,7 +1625,7 @@ private:
 
     };
 
-    pool_.enqueue(task, batch);
+    pool_->enqueue(task, batch);
   }
 
 public:
@@ -1618,26 +1636,31 @@ public:
   template <class... Args>
   MultiNodeAsyncGraphGroup(Ptr<Config> options, Args... args)
       : GraphGroup(options),
-        devices_{options_->get<std::vector<size_t>>("devices")},
-        pool_{devices_.size(), devices_.size()},
-        mutexGpuShards_{devices_.size()},
+        multiNodeDevices_{options_->get<std::vector<size_t>>("multi-node-devices")},
+        dropRate_{options_->get<double>("multi-node-drop-rate")},
+        commOverlap_{options_->get<bool>("multi-node-overlap")},
+        maxNumberComputeIters_{options_->get<int>("multi-node-max-compute")},
+        commOverlapSingleActive_{options_->get<bool>("multi-node-single-comm")},
         movingAvg_{options_->get<bool>("moving-average")},
         mvDecay_{(float)options_->get<double>("moving-decay")},
-        dropRate_{options_->get<double>("drop-rate")},
-        tau_{options_->get<size_t>("tau")},
-        gpuSummedWordCounts_(devices_.size(), 0),
-        gpuCommittedWordCounts_(devices_.size(), 0),
-        commBuffersFilled_(devices_.size(), false),
-        mutexCommBuffersFilled_{devices_.size()},
-        cvCommBuffersFilled_{devices_.size()},
-        numberComputeIters_(devices_.size(), 0) {
+        tau_{options_->get<size_t>("tau")} {
+    setupClientsOfNodesAndDevices();
+    gpuSummedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
+    gpuCommittedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
+    commBuffersFilled_ = std::vector<bool>(devices_.size(), false);
+    mutexCommBuffersFilled_ = std::vector<std::mutex>{devices_.size()};
+    cvCommBuffersFilled_ = std::vector<std::condition_variable>(devices_.size());
+    numberComputeIters_ = std::vector<size_t>(devices_.size(), 0);
+    mutexGpuShards_ = std::vector<std::mutex>(devices_.size());
+    pool_ = new marian::ThreadPool(devices_.size(), devices_.size());
+
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
       graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
       graphs_.push_back(graph);
       gpuShardsOpts_.push_back(Optimizer(options_));
-      localOpts_.push_back(Optimizer(options)); // => for simple SGD opt: localOpts_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
+      localOpts_.push_back(Optimizer(options_)); // => for simple SGD opt: localOpts_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
       builders_.push_back(New<Builder>(options_, args...));
     }
   }
@@ -1648,6 +1671,7 @@ public:
   ~MultiNodeAsyncGraphGroup() {
     if (commOverlap_) { shutDownCommOverlapThreads(); } // Order is important, this needs to run before server threads are shut down
     shutDownServerShardThread();
+    delete pool_;
   }
 
   /**
