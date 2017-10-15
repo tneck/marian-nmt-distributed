@@ -925,8 +925,6 @@ private:
       );
     }
     cudaStreamSynchronize(0);
-    // Initialize MPI variables for inter-node communication
-    initMPI();
     // Initialize variables for server shard
     initServerShard();
     // Initialize client variables for inter-node communication
@@ -1644,6 +1642,7 @@ public:
         movingAvg_{options_->get<bool>("moving-average")},
         mvDecay_{(float)options_->get<double>("moving-decay")},
         tau_{options_->get<size_t>("tau")} {
+    initMPI();
     setupClientsOfNodesAndDevices();
     gpuSummedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
     gpuCommittedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
@@ -1653,7 +1652,6 @@ public:
     numberComputeIters_ = std::vector<size_t>(devices_.size(), 0);
     mutexGpuShards_ = std::vector<std::mutex>(devices_.size());
     pool_ = new marian::ThreadPool(devices_.size(), devices_.size());
-
     for(auto device : devices_) {
       auto graph = New<ExpressionGraph>();
       graph->setDevice(device);
