@@ -815,10 +815,11 @@ private:
   int mpi_my_rank_{0};
   int mpi_comm_world_size_{1};
 
-  static const int MPI_TAG_PARAM_PUSH_{1};
-  static const int MPI_TAG_PARAM_PUSH_SPARSE1_{2}, MPI_TAG_PARAM_PUSH_SPARSE2_{3}, MPI_TAG_PARAM_PUSH_SPARSE3_{4};
-  static const int MPI_TAG_GRAD_PUSH_{5};
-  static const int MPI_TAG_GRAD_PUSH_SPARSE1_{6}, MPI_TAG_GRAD_PUSH_SPARSE2_{7}, MPI_TAG_GRAD_PUSH_SPARSE3_{8};
+  static const int MPI_TAG_GRAD_PUSH_{0};
+  static const int MPI_TAG_GRAD_PUSH_SPARSE1_{1}, MPI_TAG_GRAD_PUSH_SPARSE2_{2}, MPI_TAG_GRAD_PUSH_SPARSE3_{3};
+  static const int MPI_TAG_BATCH_WORDS_PUSH_{4};
+  static const int MPI_TAG_PARAM_PUSH_{5};
+  static const int MPI_TAG_PARAM_PUSH_SPARSE1_{6}, MPI_TAG_PARAM_PUSH_SPARSE2_{7}, MPI_TAG_PARAM_PUSH_SPARSE3_{8};
 
   // Server (shard) thread variables
 
@@ -1141,8 +1142,14 @@ private:
     serverShardThread_ = new std::thread( [this] {
       MPI_Status status;
       do {
+        size_t batchWords = 0;
+
         // Receive grads from any client
         MPI_Recv(serverShardBuffer_.data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, MPI_ANY_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, &status);
+        // If batch-flexible-lr enabled, receive batch words
+        if (scale_lr) {
+          MPI_Recv(&batchWords, 1, MPI_UNSIGNED_LONG, status.MPI_SOURCE, MPI_TAG_BATCH_WORDS_PUSH_, MPI_COMM_WORLD, &status);
+        }
 
         // Update shard params asynchronously over GPUs
         std::vector<std::thread> threads;
@@ -1157,7 +1164,11 @@ private:
             cudaMemcpy(gpuShardsGrads_[gpu]->data(), &serverShardBuffer_.at(offset), size * sizeof(float), cudaMemcpyHostToDevice);
             cudaStreamSynchronize(0);
             // Run optimizer on GPU
-            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
+            if (scale_lr && batchWords > 0) {
+              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords/average_batch_words);
+            } else {
+              gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
+            }
             cudaStreamSynchronize(0);
             // Copy params from GPU
             cudaMemcpy(&serverShardBuffer_.at(offset), gpuShardsParams_[gpu]->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
@@ -1203,6 +1214,10 @@ private:
 
           // Send grads to server
           MPI_Ssend(clientCommBufferGrads_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
+          // If batch-flexible-lr enabled, send batch words
+          if (scale_lr) {
+            MPI_Ssend(&batchWords, 1, MPI_UNSIGNED_LONG, node, MPI_TAG_BATCH_WORDS_PUSH_, MPI_COMM_WORLD);
+          }
           // Receive updated params from server
           MPI_Recv(clientCommBufferParams_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
