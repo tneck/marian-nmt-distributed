@@ -824,6 +824,7 @@ private:
   // Server (shard) thread variables
 
   std::thread * serverShardThread_;
+  bool startedServerShardThread_{false};
   bool stopServerShardThread_{false};
 
   std::vector<float> serverShardBuffer_;
@@ -881,6 +882,7 @@ private:
   std::mutex mutexCommChannel_; // Mutex to limit communication channel to one overlapping thread (if commOverlapSingleActive_ == true)
 
   std::vector<std::thread*> clientCommThreads_;
+  bool startedCommOverlapThreads_{false};
   bool stopClientCommThreads_{false};
 
   std::vector<Tensor> commBufferParams_;
@@ -936,10 +938,12 @@ private:
       launchSparseServerShardThread();
     } else {
       launchServerShardThread();
+      startedServerShardThread_ = true;
     }
     // Launch compute/communicate overlap threads if enabled
     if (commOverlap_) {
       launchCommOverlapThreads();
+      startedCommOverlapThreads_ = true;
     }
   }
 
@@ -1427,6 +1431,8 @@ private:
             cvCommBuffersFilled_[gpu].wait(uniqueLock);
           }
 
+          if (stopClientCommThreads_) { break; }
+
           // Synchronize with server shards
           if (dropRate_) {
             sparseSynchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, scale_lr ? gpuCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
@@ -1449,23 +1455,25 @@ private:
   void shutDownServerShardThread() { // @TODO: Test if this works properly
     #if MPI_FOUND
     LOG(info)->info("Node {} about to shut down server thread", mpi_my_rank_);
-    stopServerShardThread_ = true;
 
     if (dropRate_) { // Stop sparse server shard thread
-      // Send dummy messages to server
-      unsigned long dummyMessageInfo[] = {0, 0, 0, 0, 0};
-      MPI_Ssend(&dummyMessageInfo, 5, MPI_UNSIGNED_LONG, 0, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
-      MPI_Ssend(clientShardSparseBuffer1_[0].data(), 1, MPI_INT, 0, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
-      MPI_Ssend(clientShardSparseBuffer2_[0].data(), 1, MPI_FLOAT, 0, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);
-      // Receive server response (and discard contents)
-      MPI_Recv(&dummyMessageInfo, 5, MPI_UNSIGNED_LONG, 0, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      MPI_Recv(clientShardSparseBuffer1_[0].data(), clientShardSparseBuffer1_[0].size(), MPI_INT, 0, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      MPI_Recv(clientShardSparseBuffer2_[0].data(), clientShardSparseBuffer2_[0].size(), MPI_FLOAT, 0, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      // Send dummy messages to own server
+      unsigned long dummyMessageInfo[] = {0, 0, 0};
+      MPI_Ssend(&dummyMessageInfo, 3, MPI_UNSIGNED_LONG, mpi_my_rank_, MPI_TAG_GRAD_PUSH_SPARSE1_, MPI_COMM_WORLD);
+      MPI_Ssend(clientShardSparseBuffer1_[0].data(), 1, MPI_INT, mpi_my_rank_, MPI_TAG_GRAD_PUSH_SPARSE2_, MPI_COMM_WORLD);
+      MPI_Ssend(clientShardSparseBuffer2_[0].data(), 1, MPI_FLOAT, mpi_my_rank_, MPI_TAG_GRAD_PUSH_SPARSE3_, MPI_COMM_WORLD);
+      // Set flag to stop server thread before receiving response
+      stopServerShardThread_ = true;
+      // Receive server response
+      MPI_Recv(&dummyMessageInfo, 3, MPI_UNSIGNED_LONG, mpi_my_rank_, MPI_TAG_PARAM_PUSH_SPARSE1_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(clientShardSparseBuffer1_[0].data(), clientShardSparseBuffer1_[0].size(), MPI_INT, mpi_my_rank_, MPI_TAG_PARAM_PUSH_SPARSE2_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(clientShardSparseBuffer2_[0].data(), clientShardSparseBuffer2_[0].size(), MPI_FLOAT, mpi_my_rank_, MPI_TAG_PARAM_PUSH_SPARSE3_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    } // Stop normal server shard thread
-    else {
-      MPI_Ssend(clientCommBufferGrads_[0].data(), 1, MPI_FLOAT, 0, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD); // Send dummy grads to server
-      MPI_Recv(clientCommBufferParams_[0].data(), nodeShardSizes_[0], MPI_FLOAT, 0, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE); // Receive server response (and discard contents)
+    }
+    else { // Stop normal server shard thread
+      MPI_Ssend(clientCommBufferGrads_[0].data(), 1, MPI_FLOAT, mpi_my_rank_, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD); // Send dummy grads to server
+      stopServerShardThread_ = true; // Set flag to stop server thread before receiving its response
+      MPI_Recv(clientCommBufferParams_[0].data(), nodeShardSizes_[0], MPI_FLOAT, mpi_my_rank_, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE); // Receive server response (and discard contents)
     }
     serverShardThread_->join();
     LOG(info)->info("Node {} successfully shut down server thread", mpi_my_rank_);
@@ -1480,8 +1488,9 @@ private:
     LOG(info)->info("Node {} about to shut down client communication threads", mpi_my_rank_);
     stopClientCommThreads_ = true;
     for (int gpu = 0; gpu < devices_.size(); gpu++) {
-      commBuffersFilled_[gpu] = true; // Let thread synchronise with servers to finish execution
-      cvCommBuffersFilled_[gpu].notify_one(); // Notify in case thread in lock
+      // Unblock thread from lock and join
+      commBuffersFilled_[gpu] = true;
+      cvCommBuffersFilled_[gpu].notify_one();
       clientCommThreads_[gpu]->join();
     }
     LOG(info)->info("Node {} successfully shut down client communication threads", mpi_my_rank_);
@@ -1682,8 +1691,8 @@ public:
    * @brief (Destructor) Shut down server shard thread and (if comm. overlap enabled) communication overlap threads
    */
   ~MultiNodeAsyncGraphGroup() {
-    if (commOverlap_) { shutDownCommOverlapThreads(); } // Order is important, this needs to run before server threads are shut down
-    shutDownServerShardThread();
+    if (commOverlap_ && startedCommOverlapThreads_) { shutDownCommOverlapThreads(); } // Order is important, this needs to run before server threads are shut down
+    if (startedServerShardThread_) shutDownServerShardThread();
     delete pool_;
   }
 
