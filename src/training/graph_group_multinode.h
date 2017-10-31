@@ -1024,4 +1024,5 @@ public:
     return builders_[0]->collectStats(graphs_[0]);
   }
 };
+
 }
