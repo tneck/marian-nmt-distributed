@@ -1,7 +1,7 @@
 #if MPI_FOUND
 #include <mpi.h>
-#include <training/graph_group_multinode.h>
-
+#include "training/graph_group_multinode.h"
+#include "training/graph_group_multinode.cu"
 #endif
 
 #include "marian.h"

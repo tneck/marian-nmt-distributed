@@ -29,6 +29,7 @@ cuda_add_library(marian
   translator/output_collector.cpp
   translator/nth_element.cu
   translator/helpers.cu
+  training/graph_group_multinode.cu
   data/vocab.cpp
   data/corpus.cpp
   data/text_input.cpp
