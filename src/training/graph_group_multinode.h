@@ -15,9 +15,7 @@
 #include "common/definitions.h"
 #include "data/batch_generator.h"
 #include "optimizers/optimizers.h"
-#include "training/dropper.h"
 #include "training/scheduler.h"
-#include "training/sparse_tensor.h"
 #include "training/training.h"
 #include "training/validator.h"
 #include "training/graph_group.h"
@@ -28,14 +26,14 @@ namespace marian {
  * @brief Multi-node graph group for asynchronous training over multiple machines each with one or multiple GPUs
  */
 template <class Builder>
-class MultiNodeAsyncGraphGroup : public GraphGroup {
+class MultiNodeGraphGroup : public GraphGroup {
 public:
   typedef Builder builder_type;
   typedef typename Builder::dataset_type dataset_type;
 
   virtual void setScheduler(Ptr<Scheduler<dataset_type>> scheduler);
 
-private:
+protected:
 
   // Variables inherited from AsyncGraphGroup
 
@@ -70,10 +68,8 @@ private:
   int mpi_comm_world_size_{1};
 
   static const int MPI_TAG_GRAD_PUSH_{0};
-  static const int MPI_TAG_GRAD_PUSH_SPARSE1_{1}, MPI_TAG_GRAD_PUSH_SPARSE2_{2}, MPI_TAG_GRAD_PUSH_SPARSE3_{3};
   static const int MPI_TAG_BATCH_WORDS_PUSH_{4};
   static const int MPI_TAG_PARAM_PUSH_{5};
-  static const int MPI_TAG_PARAM_PUSH_SPARSE1_{6}, MPI_TAG_PARAM_PUSH_SPARSE2_{7}, MPI_TAG_PARAM_PUSH_SPARSE3_{8};
 
   // Server (shard) thread variables
 
@@ -92,6 +88,8 @@ private:
   std::vector<std::vector<float>> clientCommBufferParams_; // per client (GPU)
   std::vector<std::vector<float>> clientCommBufferGrads_;
 
+  std::vector<int> numberClientsOfNodes_;
+
   std::vector<size_t> nodeShardSizes_;
   std::vector<size_t> gpuShardSizes_;
 
@@ -99,29 +97,6 @@ private:
 
   static const unsigned int MSG_INFO_SIZE_{0}, MSG_INFO_CLIENT_{1}, MSG_INFO_BATCHWORDS_{2}, MSG_INFO_STATUS_{3};
   static const unsigned int STATUS_NODE_TRAINING_{0}, STATUS_NODE_FINISHED_{1};
-
-  // Sparse communication variables
-
-  double dropRate_;
-
-  std::vector<int> serverShardSparseBuffer1_;
-  std::vector<float> serverShardSparseBuffer2_;
-
-  std::vector<std::vector<int>> clientShardSparseBuffer1_;
-  std::vector<std::vector<float>> clientShardSparseBuffer2_;
-
-  std::vector<int> numberClientsOfNodes_;
-  std::vector<std::vector<size_t>> clientSizesOfNodes_;
-  std::vector<std::vector<std::vector<Tensor>>> clientsParams_; // => clientsParams_[shard][node][client]
-
-  std::vector<SparseTensor> localSparseGrads_;
-  std::vector<SparseTensor> shardSparseGrads_;
-  std::vector<SparseTensor> tmpSparseDeltas_;
-  std::vector<SparseTensor> localSparseDeltas_;
-
-  std::vector<std::vector<std::vector<GradientDrop>>> fetchDroppers_; // => fetchDroppers_[shard][node][client]
-  std::vector<std::vector<GradientDrop>> gradientDroppers_; // => gradientDroppers_[gpu][node]
-  std::vector<Tensor> tmpDeltas_;
 
   // Computations/communication overlap variables
 
@@ -157,12 +132,12 @@ private:
   Tensor newTensor(int size, int device);
 
   /**
-   * @brief Initialize graphs and variables for MPI, remote communicator, server shard, sparse communication
+   * @brief Initialize graphs and variables for MPI, remote communicator, server shard,
    * and overlapping compute/communicate, and launch server and client communication threads
    *
    * @param batch Batch to build initial graph with
    */
-  void initFirstRun(Ptr<data::Batch> batch);
+  virtual void initFirstRun(Ptr<data::Batch> batch, bool launchServerThread);
 
   /**
    * @brief Initialize variables relevant to MPI, i.e. size of cluster and rank of this node
@@ -172,12 +147,7 @@ private:
   /**
    * @brief Initialize server shard, i.e. sizes, parameters, gradients and buffers
    */
-  void initServerShard();
-
-  /**
-   * @brief Initialize sparse variables for server shards, i.e. number and sizes of clients of every node, relevant sparse variables and send/receive buffers @TODO: Further clean-up
-   */
-  void initServerShardSparseVars();
+  virtual void initServerShard(bool initFullSendReceiveBuffer = true);
 
   /**
    * @brief Get number of clients of every node by communicating with all nodes in cluster @TODO: Communication will not be necessary once run-time option is implemented
@@ -185,20 +155,14 @@ private:
   void setupClientsOfNodesAndDevices();
 
   /**
-   * @brief Determine size for all clients of every node
-   */
-  void setupClientSizesOfNodes();
-
-  /**
    * @brief Initialize client buffers for remote communication (synchronisation)
    */
-  void initRemoteCommunicationVars();
+  virtual void initRemoteCommunicationVars(bool initBuffers = true);
 
   /*
    * @brief Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters
-   * @TODO: Implement batch-flexible-lr in non-sparse by sending messageInfo through MPI with number of batch words
    */
-  void launchServerShardThread();
+  virtual void launchServerShardThread();
 
   /**
    * @brief Send new gradients to the server shards and receive the updated (global) parameters
@@ -209,24 +173,7 @@ private:
    * @param batchWords Number of batch words to pass to server shard optimizers
    * @param optionalBlockMutex Optional mutex that has to be locked during synchronization
    */
-  void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr);
-
-  /*
-   * @brief Launch independent thread which continually receives sparse gradients assigned to this shard from any client,
-   * runs the shard optimizer and sends back sparse deltas given the updated parameters (sparse communication)
-   */
-  void launchSparseServerShardThread();
-
-  /**
-   * @brief Send new sparse gradients to the server shards, receive sparse deltas and apply these to the parameters to get the updated (global) parameters
-   *
-   * @param newGrads Gradients to send sparsely
-   * @param oldParams Parameters to update with deltas
-   * @param gpu GPU/client performing synchronize (to access appropriate buffers etc.)
-   * @param batchWords Number of batch words to pass to server shard optimizers
-   * @param optionalBlockMutex Optional mutex that has to be locked during synchronization
-   */
-  void sparseSynchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr);
+  virtual void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr);
 
   /**
    * @brief Launch independent threads which continually synchronize their client's gradients/parameters whenever the respective communication buffers are full
@@ -244,7 +191,7 @@ private:
   /**
    * @brief Notify server shards that this node has finished training
    */
-  void signalFinishedToServerShards();
+  virtual void signalFinishedToServerShards();
 
   /**
    * @brief Safely shut down the launched server shard thread
@@ -262,10 +209,9 @@ public:
    * @brief (Constructor) Configure settings and initialize graphs, shard optimizers, local optimizers, graph builders, etc. and their associated variables
    */
   template <class... Args>
-  MultiNodeAsyncGraphGroup(Ptr<Config> options, Args... args)
+  MultiNodeGraphGroup(Ptr<Config> options, Args... args)
       : GraphGroup(options),
         multiNodeDevices_{options_->get<std::vector<size_t>>("multi-node-devices")},
-        dropRate_{options_->get<double>("multi-node-drop-rate")},
         commOverlap_{options_->get<bool>("multi-node-overlap")},
         maxNumberComputeIters_{options_->get<int>("multi-node-max-compute")},
         commOverlapSingleActive_{options_->get<bool>("multi-node-single-comm")},
@@ -296,8 +242,8 @@ public:
   /**
    * @brief (Destructor) Shut down server shard thread and (if comm. overlap enabled) communication overlap threads
    */
-  ~MultiNodeAsyncGraphGroup() {
-    LOG(info)->info("Shutting down MultiNodeAsyncGraphGroup threads");
+  virtual ~MultiNodeGraphGroup() {
+    LOG(info)->info("Shutting down MultiNodeGraphGroup threads");
     if (firstBatchProcessed_) {
       if (commOverlap_) { shutDownCommOverlapThreads(); }
       signalFinishedToServerShards(); // notify other nodes that this node has finished training

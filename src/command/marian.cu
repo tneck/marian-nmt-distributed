@@ -1,7 +1,7 @@
 #if MPI_FOUND
 #include <mpi.h>
 #include "training/graph_group_multinode.h"
-#include "training/graph_group_multinode.cu"
+#include "training/graph_group_multinode.cu" // @TODO: This is a temporary workaround to splitting up graph_group_multinode into both .h and .cu
 #endif
 
 #include "marian.h"
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
   if (true || comm_world_size > 1) {
     if (suitable_thread_mode) {
       LOG(info)->info("Launching Multi-Node Asynchronous Graph Group");
-      WrapModelType<Train, MultiNodeAsyncGraphGroup>(options)->run();
+      WrapModelType<Train, MultiNodeGraphGroup>(options)->run();
     } else {
       LOG(info)->info("ERROR: No suitable MPI thread mode found. Required: MPI_THREAD_MULTIPLE. Please configure your MPI implementation appropriately. Aborting.");
     }
