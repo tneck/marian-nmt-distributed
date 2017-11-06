@@ -1,7 +1,9 @@
 #if MPI_FOUND
 #include <mpi.h>
 #include "training/graph_group_multinode.h"
-#include "training/graph_group_multinode.cu" // @TODO: This is a temporary workaround to splitting up graph_group_multinode into both .h and .cu
+#include "training/graph_group_multinode.cu" // @TODO: Remove when template arguments removed from MultiNodeGraphGroup
+#include "training/graph_group_multinode_sparse.h"
+#include "training/graph_group_multinode_sparse.cu" // @TODO: Remove when template arguments removed from MultiNodeSparseGraphGroup
 #endif
 
 #include "marian.h"
@@ -19,7 +21,7 @@ int main(int argc, char** argv) {
   bool suitable_thread_mode = false;
 
   #if MPI_FOUND
-  bool mpiEnabled = true; // @TODO: Load from options
+  bool mpiEnabled = options->get<bool>("multi-node");
   if (mpiEnabled) {
     int provided_thread_mode = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_mode);
@@ -31,8 +33,13 @@ int main(int argc, char** argv) {
 
   if (true || comm_world_size > 1) {
     if (suitable_thread_mode) {
-      LOG(info)->info("Launching Multi-Node Asynchronous Graph Group");
-      WrapModelType<Train, MultiNodeGraphGroup>(options)->run();
+      if(!options->get<double>("multi-node-drop-rate")) {
+        LOG(info)->info("Launching Multi-Node Graph Group");
+        WrapModelType<Train, MultiNodeGraphGroup>(options)->run();
+      } else {
+        LOG(info)->info("Launching Multi-Node Sparse Graph Group");
+        WrapModelType<Train, MultiNodeSparseGraphGroup>(options)->run();
+      }
     } else {
       LOG(info)->info("ERROR: No suitable MPI thread mode found. Required: MPI_THREAD_MULTIPLE. Please configure your MPI implementation appropriately. Aborting.");
     }

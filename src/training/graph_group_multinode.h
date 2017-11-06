@@ -137,7 +137,7 @@ protected:
    *
    * @param batch Batch to build initial graph with
    */
-  virtual void initFirstRun(Ptr<data::Batch> batch, bool launchServerThread);
+  virtual void initFirstRun(Ptr<data::Batch> batch);
 
   /**
    * @brief Initialize variables relevant to MPI, i.e. size of cluster and rank of this node
@@ -243,14 +243,12 @@ public:
    * @brief (Destructor) Shut down server shard thread and (if comm. overlap enabled) communication overlap threads
    */
   virtual ~MultiNodeGraphGroup() {
-    LOG(info)->info("Shutting down MultiNodeGraphGroup threads");
     if (firstBatchProcessed_) {
       if (commOverlap_) { shutDownCommOverlapThreads(); }
       signalFinishedToServerShards(); // notify other nodes that this node has finished training
       shutDownServerShardThread();
     }
     delete pool_;
-    LOG(info)->info("Shutdown successful");
   }
 
   /**

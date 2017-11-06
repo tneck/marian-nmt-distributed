@@ -24,7 +24,7 @@ Tensor MultiNodeGraphGroup<Builder>::newTensor(int size, int device) {
 }
 
 template <class Builder>
-void MultiNodeGraphGroup<Builder>::initFirstRun(Ptr<data::Batch> batch, bool launchServerThread) {
+void MultiNodeGraphGroup<Builder>::initFirstRun(Ptr<data::Batch> batch) {
   // Initialize client graphs (incl. params) and builders
   for (size_t i = 0; i < graphs_.size(); ++i) {
     THREAD_GUARD(
@@ -38,9 +38,7 @@ void MultiNodeGraphGroup<Builder>::initFirstRun(Ptr<data::Batch> batch, bool lau
   // Initialize client variables for inter-node communication
   initRemoteCommunicationVars();
   // Launch server shard thread to communicate with clients
-  if (launchServerThread) {
-    launchServerShardThread();
-  }
+  launchServerShardThread();
   // Launch compute/communicate overlap threads if enabled
   if (commOverlap_) {
     launchCommOverlapThreads();
@@ -287,7 +285,7 @@ void MultiNodeGraphGroup<Builder>::launchCommOverlapThreads() {
 template <class Builder>
 void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
   if (!firstBatchProcessed_) {
-    initFirstRun(batch, true);
+    initFirstRun(batch);
     firstBatchProcessed_ = true;
   }
 

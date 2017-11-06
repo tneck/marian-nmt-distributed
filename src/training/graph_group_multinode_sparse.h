@@ -28,7 +28,7 @@ namespace marian {
  * @brief Multi-node graph group for asynchronous training over multiple machines each with one or multiple GPUs
  */
 template <class Builder>
-class MultiNodeSparseGraphGroup : public MultiNodeGraphGroup {
+class MultiNodeSparseGraphGroup : public MultiNodeGraphGroup<Builder> {
 private:
 
   // MPI variables
@@ -57,14 +57,6 @@ private:
   std::vector<std::vector<std::vector<GradientDrop>>> fetchDroppers_; // => fetchDroppers_[shard][node][client]
   std::vector<std::vector<GradientDrop>> gradientDroppers_; // => gradientDroppers_[gpu][node]
   std::vector<Tensor> tmpDeltas_;
-
-  /**
-   * @brief Initialize graphs and variables for MPI, remote communicator, server shard, sparse communication
-   * and overlapping compute/communicate, and launch server and client communication threads
-   *
-   * @param batch Batch to build initial graph with
-   */
-  virtual void initFirstRun(Ptr<data::Batch> batch, bool launchServerThread);
 
   /**
    * @brief Initialize server shard, i.e. sizes, parameters, gradients and buffers
@@ -97,6 +89,12 @@ private:
    */
   virtual void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr);
 
+
+  /**
+   * @brief Notify server shards that this node has finished training
+   */
+  virtual void signalFinishedToServerShards();
+
 public:
 
   /**
@@ -105,8 +103,8 @@ public:
    */
   template <class... Args>
   MultiNodeSparseGraphGroup(Ptr<Config> options, Args... args)
-      : MultiNodeGraphGroup(options),
-        dropRate_{options_->get<double>("multi-node-drop-rate")} {}
+      : MultiNodeGraphGroup<Builder>(options),
+        dropRate_{options->get<double>("multi-node-drop-rate")} {}
 
 };
 
