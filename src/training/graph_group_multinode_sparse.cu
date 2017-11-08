@@ -188,16 +188,16 @@ void MultiNodeSparseGraphGroup<Builder>::synchronizeWithServerShards(Tensor newG
     SparseTensor sparseSubNewGrads = localSparseGrads_[gpu];
 
     // Copy to buffers
-    cudaMemcpy(clientShardSparseBuffer1_[gpu].data(), sparseSubNewGrads->indices(), sparseSubNewGrads->size() * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(clientShardSparseBuffer2_[gpu].data(), sparseSubNewGrads->data(), sparseSubNewGrads->size() * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaStreamSynchronize(0); // @TODO: Use safer memory copy by taking min(sparseSubNewGradsSize, bufferSize)
+    cudaMemcpy(clientShardSparseBuffer1_[gpu].data(), sparseSubNewGrads->indices(), std::min((size_t) sparseSubNewGrads->size(), nodeSize) * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(clientShardSparseBuffer2_[gpu].data(), sparseSubNewGrads->data(), std::min((size_t) sparseSubNewGrads->size(), nodeSize) * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaStreamSynchronize(0);
 
     unsigned long messageInfo[4];
     {
       std::unique_lock<std::mutex> uniqueAccess = (optionalBlockMutex == nullptr) ? std::unique_lock<std::mutex>() : std::unique_lock<std::mutex>(*optionalBlockMutex, std::try_to_lock); // Lock mutex if provided
 
       // Send sparse grads to node
-      messageInfo[this->MSG_INFO_SIZE_] = sparseSubNewGrads->size();
+      messageInfo[this->MSG_INFO_SIZE_] = std::min((size_t) sparseSubNewGrads->size(), nodeSize);
       messageInfo[this->MSG_INFO_CLIENT_] = gpu;
       messageInfo[this->MSG_INFO_BATCHWORDS_] = batchWords;
       messageInfo[this->MSG_INFO_STATUS_] = this->STATUS_NODE_TRAINING_;
@@ -228,8 +228,7 @@ void MultiNodeSparseGraphGroup<Builder>::synchronizeWithServerShards(Tensor newG
       }
       endOffset++;
 
-      SparseTensorBase(localSparseDeltas_[gpu]->data() + nodeOffset, localSparseDeltas_[gpu]->indices() + nodeOffset, endOffset - nodeOffset, gpu)
-          .scatterAdd(oldParams->subtensor(offset, nodeSize), nodeShard * nodeShardSize);
+      SparseTensorBase(localSparseDeltas_[gpu]->data() + nodeOffset, localSparseDeltas_[gpu]->indices() + nodeOffset, endOffset - nodeOffset, gpu).scatterAdd(oldParams->subtensor(offset, nodeSize), nodeShard * nodeShardSize);
       nodeOffset += endOffset;
     }
     cudaStreamSynchronize(0);
