@@ -9,46 +9,52 @@
 #include "common/definitions.h"
 #include "common/keywords.h"
 #include "graph/expression_graph.h"
+#include "models/model_base.h"
 
 #include "examples/mnist/dataset.h"
+#include "models/encdec.h"
 
 namespace marian {
 namespace models {
 
-class MNISTModel {
-private:
-  Ptr<Config> options_;
-  bool inference_{false};
-  std::vector<int> dims_{784, 2048, 2048, 10};
-
+class MnistFeedForwardNet : public ModelBase {
 public:
-  typedef data::MNIST dataset_type;
+  typedef data::MNISTData dataset_type;
 
   template <class... Args>
-  MNISTModel(Ptr<Config> options, Args... args)
-      : options_(options),
-        inference_(Get(keywords::inference, false, args...)) {}
+  MnistFeedForwardNet(Ptr<Options> options, Args... args)
+      : options_(options), inference_(options->get<bool>("inference", false)) {}
 
-  Expr build(Ptr<ExpressionGraph> graph, Ptr<data::Batch> batch) {
-    return FeedforwardClassifier(graph, dims_, batch, inference_);
+  virtual Expr build(Ptr<ExpressionGraph> graph,
+                     Ptr<data::Batch> batch,
+                     bool clean = false) {
+    return construct(graph, batch, inference_);
   }
 
   void load(Ptr<ExpressionGraph> graph, const std::string& name) {
-    LOG(info)->critical("Loading MNIST model is not supported");
+    LOG(critical, "Loading MNIST model is not supported");
   }
 
-  void save(Ptr<ExpressionGraph> graph,
-            const std::string& name,
-            bool foo = true) {
-    LOG(info)->critical("Saving MNIST model is not supported");
+  void save(Ptr<ExpressionGraph> graph, const std::string& name, bool) {
+    LOG(critical, "Saving MNIST model is not supported");
   }
 
-  Ptr<data::BatchStats> collectStats(Ptr<ExpressionGraph> graph) {
-    LOG(info)->critical("Collecting stats in MNIST model is not supported");
+  void save(Ptr<ExpressionGraph> graph, const std::string& name) {
+    LOG(critical, "Saving MNIST model is not supported");
+  }
+
+  Ptr<data::BatchStats> collectStats(Ptr<ExpressionGraph> graph,
+                                     size_t multiplier) {
+    LOG(critical, "Collecting stats in MNIST model is not supported");
     return nullptr;
   }
 
-private:
+  virtual void clear(Ptr<ExpressionGraph> graph) { graph->clear(); };
+
+protected:
+  Ptr<Options> options_;
+  bool inference_{false};
+
   /**
    * @brief Constructs an expression graph representing a feed-forward
    * classifier.
@@ -59,14 +65,14 @@ private:
    *
    * @return a shared pointer to the newly constructed expression graph
    */
-  Expr FeedforwardClassifier(Ptr<ExpressionGraph> g,
-                             const std::vector<int>& dims,
-                             Ptr<data::Batch> batch,
-                             bool inference = false) {
+  virtual Expr construct(Ptr<ExpressionGraph> g,
+                         Ptr<data::Batch> batch,
+                         bool inference = false) {
     using namespace keywords;
+    const std::vector<int> dims = {784, 2048, 2048, 10};
 
     // Start with an empty expression graph
-    g->clear();
+    clear(g);
 
     // Create an input layer of shape batchSize x numFeatures and populate it
     // with training features
@@ -121,7 +127,7 @@ private:
       // Define a top-level node for inference
       return logsoftmax(last);
     }
-  };
+  }
 };
 }
 }

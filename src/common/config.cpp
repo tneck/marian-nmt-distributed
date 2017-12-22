@@ -36,20 +36,13 @@ void Config::log() {
   std::vector<std::string> results;
   boost::algorithm::split(results, configString, boost::is_any_of("\n"));
   for(auto& r : results)
-    LOG(config)->info(r);
+    LOG(info, "[config] {}", r);
 }
 
 void Config::override(const YAML::Node& params) {
   for(auto& it : params) {
     config_[it.first.as<std::string>()] = it.second;
   }
-}
-
-YAML::Node Config::getModelParameters() {
-  YAML::Node modelParams;
-  for(auto& key : modelFeatures_)
-    modelParams[key] = config_[key];
-  return modelParams;
 }
 
 void Config::loadModelParameters(const std::string& name) {
@@ -62,10 +55,6 @@ void Config::GetYamlFromNpz(YAML::Node& yaml,
                             const std::string& varName,
                             const std::string& fName) {
   yaml = YAML::Load(cnpy::npz_load(fName, varName).data);
-}
-
-void Config::saveModelParameters(const std::string& name) {
-  AddYamlToNpz(getModelParameters(), "special:model.yml", name);
 }
 
 void Config::AddYamlToNpz(const YAML::Node& yaml,

@@ -1,6 +1,9 @@
-#include "utils.h"
 #include <iostream>
 #include <sstream>
+
+#include "3rd_party/exception.h"
+#include "common/logging.h"
+#include "common/utils.h"
 
 void Trim(std::string& s) {
   boost::trim_if(s, boost::is_any_of(" \t\n"));
@@ -37,4 +40,18 @@ std::string Join(const std::vector<std::string>& words, const std::string del) {
     ss << del << words[i];
   }
   return ss.str();
+}
+
+std::string Exec(const std::string& cmd) {
+  std::array<char, 128> buffer;
+  std::string result;
+  std::shared_ptr<std::FILE> pipe(popen(cmd.c_str(), "r"), pclose);
+  if(!pipe)
+    ABORT("popen() failed!");
+
+  while(!std::feof(pipe.get())) {
+    if(std::fgets(buffer.data(), 128, pipe.get()) != NULL)
+      result += buffer.data();
+  }
+  return result;
 }

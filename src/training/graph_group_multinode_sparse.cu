@@ -1,10 +1,11 @@
 #include "training/graph_group_multinode_sparse.h"
 
+#include "kernels/tensor_operators.h"
+
 namespace marian {
 
-template <class Builder>
-void MultiNodeSparseGraphGroup<Builder>::initServerShard(bool initFullSendReceiveBuffer) {
-  MultiNodeGraphGroup<Builder>::initServerShard(false);
+void MultiNodeSparseGraphGroup::initServerShard(bool initFullSendReceiveBuffer) {
+  MultiNodeGraphGroup::initServerShard(false);
 
   // Initialize sizes of clients of every node in cluster
   setupClientSizesOfNodes();
@@ -18,7 +19,7 @@ void MultiNodeSparseGraphGroup<Builder>::initServerShard(bool initFullSendReceiv
   for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
     size_t size = std::min(gpuShardSize, thisNodeSize - offset);
 
-    tmpDeltas_.push_back(MultiNodeGraphGroup<Builder>::newTensor(size, this->devices_[gpu]));
+    tmpDeltas_.push_back(MultiNodeGraphGroup::newTensor(size, this->devices_[gpu]));
     int sparseCap = this->graphs_[0]->params()->vals()->size() * 1.2 * (1.0 - dropRate_); // (Estimated) Max size of sparse buffers
 
     // Server side
@@ -36,7 +37,7 @@ void MultiNodeSparseGraphGroup<Builder>::initServerShard(bool initFullSendReceiv
       std::vector<Tensor> nodeParams;
       std::vector<GradientDrop> nodeDroppers;
       for (int client = 0; client < this->numberClientsOfNodes_[node]; client++) {
-        Tensor clientTensor = MultiNodeGraphGroup<Builder>::newTensor(size, this->devices_[gpu]);
+        Tensor clientTensor = MultiNodeGraphGroup::newTensor(size, this->devices_[gpu]);
         clientTensor->copyFrom(this->graphs_[0]->params()->vals()->subtensor(offset, size)); // Copy initial shard params into tensor
         nodeParams.push_back(clientTensor);
         nodeDroppers.push_back(GradientDrop(new GradientDropBase()));
@@ -57,8 +58,7 @@ void MultiNodeSparseGraphGroup<Builder>::initServerShard(bool initFullSendReceiv
   serverShardSparseBuffer2_ = std::vector<float>(this->nodeShardSizes_[this->mpi_my_rank_]);
 }
 
-template <class Builder>
-void MultiNodeSparseGraphGroup<Builder>::setupClientSizesOfNodes() {
+void MultiNodeSparseGraphGroup::setupClientSizesOfNodes() {
   for (int node = 0; node < this->mpi_comm_world_size_; node++) {
     std::string s = "Node ";
     s += std::to_string(node) + " parameter sharding: ";
@@ -75,13 +75,12 @@ void MultiNodeSparseGraphGroup<Builder>::setupClientSizesOfNodes() {
       s += " " + std::to_string(size);
       s += client == this->numberClientsOfNodes_[node] - 1 ? "" : ", ";
     }
-    if (this->mpi_my_rank_ == 0) { LOG(info)->info(s); } // If node 0, print parameter sharding layout
+    //if (this->mpi_my_rank_ == 0) { LOG(info)->info(s); } // If node 0, print parameter sharding layout
   }
 }
 
-template <class Builder>
-void MultiNodeSparseGraphGroup<Builder>::initRemoteCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
-  MultiNodeGraphGroup<Builder>::initRemoteCommunicationVars(false);
+void MultiNodeSparseGraphGroup::initRemoteCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
+  MultiNodeGraphGroup::initRemoteCommunicationVars(false);
   for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
     size_t size = this->nodeShardSizes_[this->mpi_my_rank_] * 3 * (1.0 - min(0.99, dropRate_));
     clientShardSparseBuffer1_.push_back(std::vector<int>(size));
@@ -89,8 +88,7 @@ void MultiNodeSparseGraphGroup<Builder>::initRemoteCommunicationVars(bool initBu
   }
 }
 
-template <class Builder>
-void MultiNodeSparseGraphGroup<Builder>::launchServerShardThread() {
+void MultiNodeSparseGraphGroup::launchServerShardThread() {
   #if MPI_FOUND
   this->serverShardThread_ = new std::thread([this] {
     int nCommunicatingNodes = this->mpi_comm_world_size_; // keep track of number of nodes still communicating with this shard
@@ -127,15 +125,15 @@ void MultiNodeSparseGraphGroup<Builder>::launchServerShardThread() {
           cudaStreamSynchronize(0);
 
           // Run optimizer on GPU
-          if (this->scale_lr && batchWords > 0) {
-            this->gpuShardsOpts_[gpu]->update(this->gpuShardsParams_[gpu], this->gpuShardsGrads_[gpu], batchWords / this->average_batch_words);
+          if (this->scaleLearningRate_ && batchWords > 0) {
+            this->gpuShardsOpts_[gpu]->update(this->gpuShardsParams_[gpu], this->gpuShardsGrads_[gpu], batchWords / this->avgBatchWords_);
           } else {
             this->gpuShardsOpts_[gpu]->update(this->gpuShardsParams_[gpu], this->gpuShardsGrads_[gpu]);
           }
           cudaStreamSynchronize(0);
 
           // Get deltas = params latest version - params local version
-          Element(_1 = _2 - _3, tmpDeltas_[gpu], this->gpuShardsParams_[gpu], clientsParams_[gpu][status.MPI_SOURCE][client]);
+          Element(functional::_1 = functional::_2 - functional::_3, tmpDeltas_[gpu], this->gpuShardsParams_[gpu], clientsParams_[gpu][status.MPI_SOURCE][client]);
           cudaStreamSynchronize(0);
 
           // Get sparse deltas
@@ -175,8 +173,7 @@ void MultiNodeSparseGraphGroup<Builder>::launchServerShardThread() {
   #endif
 }
 
-template <class Builder>
-void MultiNodeSparseGraphGroup<Builder>::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords, std::mutex *optionalBlockMutex) {
+void MultiNodeSparseGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords, std::mutex *optionalBlockMutex) {
   #if MPI_FOUND
   size_t offset = 0;
   for (int node = 0; node < this->mpi_comm_world_size_; node++) {
@@ -238,8 +235,7 @@ void MultiNodeSparseGraphGroup<Builder>::synchronizeWithServerShards(Tensor newG
   #endif
 }
 
-template <class Builder>
-void MultiNodeSparseGraphGroup<Builder>::signalFinishedToServerShards() {
+void MultiNodeSparseGraphGroup::signalFinishedToServerShards() {
 #if MPI_FOUND
   unsigned long messageInfo[4];
   messageInfo[this->MSG_INFO_STATUS_] = this->STATUS_NODE_FINISHED_;

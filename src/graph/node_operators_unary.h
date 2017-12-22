@@ -4,22 +4,10 @@
 #include "graph/node.h"
 #include "kernels/sparse.h"
 #include "kernels/tensor_operators.h"
-#include "kernels/thrust_functions.h"
 #include "tensors/tensor.h"
+#include "functional/functional.h"
+#include "kernels/cudnn_wrappers.h"
 
-#ifdef CUDNN
-
-#include <cudnn.h>
-
-#define CUDA_CALL(x) do { if((x) != cudaSuccess) { \
-      printf("Error at %s:%d\n",__FILE__,__LINE__);     \
-      return EXIT_FAILURE;}} while(0)
-
-#define CUDNN_CALL(x) do { if((x) != CUDNN_STATUS_SUCCESS) { \
-      printf("Error (%s) at %s:%d\n",cudnnGetErrorString(x),__FILE__,__LINE__);     \
-      }} while(0)
-
-#endif
 
 namespace marian {
 
@@ -41,12 +29,35 @@ public:
       : UnaryNodeOp(a, args...), scalar_{scalar} {}
 
   NodeOps forwardOps() {
+    using namespace functional;
     return {NodeOp(Element(_1 = _2 + scalar_, val_, child(0)->val()))};
   }
 
-  NodeOps backwardOps() { return {NodeOp(Add(_1, child(0)->grad(), adj_))}; }
+  NodeOps backwardOps() {
+    using namespace functional;
+    return {NodeOp(Add(_1, child(0)->grad(), adj_))};
+  }
 
   const std::string type() { return "scalar_add"; }
+
+  virtual size_t hash() {
+    if(!hash_) {
+      hash_ = NaryNodeOp::hash();
+      boost::hash_combine(hash_, scalar_);
+    }
+    return hash_;
+  }
+
+  virtual bool equal(Expr node) {
+    if(!NaryNodeOp::equal(node))
+      return false;
+    auto cnode = std::dynamic_pointer_cast<ScalarAddNodeOp>(node);
+    if(!cnode)
+      return false;
+    if(scalar_ != cnode->scalar_)
+      return false;
+    return true;
+  }
 };
 
 struct ScalarMultNodeOp : public UnaryNodeOp {
@@ -59,14 +70,35 @@ public:
       : UnaryNodeOp(a, args...), scalar_{scalar} {}
 
   NodeOps forwardOps() {
+    using namespace functional;
     return {NodeOp(Element(_1 = scalar_ * _2, val_, child(0)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
     return {NodeOp(Add(scalar_ * _1, child(0)->grad(), adj_))};
   }
 
   const std::string type() { return "scalar_add"; }
+
+  virtual size_t hash() {
+    if(!hash_) {
+      hash_ = NaryNodeOp::hash();
+      boost::hash_combine(hash_, scalar_);
+    }
+    return hash_;
+  }
+
+  virtual bool equal(Expr node) {
+    if(!NaryNodeOp::equal(node))
+      return false;
+    auto cnode = std::dynamic_pointer_cast<ScalarMultNodeOp>(node);
+    if(!cnode)
+      return false;
+    if(scalar_ != cnode->scalar_)
+      return false;
+    return true;
+  }
 };
 
 struct LogitNodeOp : public UnaryNodeOp {
@@ -74,42 +106,77 @@ struct LogitNodeOp : public UnaryNodeOp {
   LogitNodeOp(Args... args) : UnaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
-    return {NodeOp(Element(_1 = Sigma(_2), val_, child(0)->val()))};
+    using namespace functional;
+    return {NodeOp(Element(_1 = logit(_2), val_, child(0)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
     return {NodeOp(Add(_1 * _2 * (1.0f - _2), child(0)->grad(), adj_, val_))};
   }
 
   const std::string type() { return "logit"; }
 };
 
+// struct Scalar2PowNodeOp : public UnaryNodeOp {
+// private:
+//  float scalar_{0};
+//
+// public:
+//  template <typename... Args>
+//  Scalar2PowNodeOp(Expr a, float scalar, Args... args)
+//      : UnaryNodeOp(a, args...), scalar_{scalar} {}
+//
+//  NodeOps forwardOps() {
+//    return {NodeOp(Element(_1 = Pow(_2, scalar_), val_, child(0)->val()))};
+//  }
+//
+//  NodeOps backwardOps() {
+//    return {NodeOp(Add(scalar_ * Pow(_1, scalar_ - 1.f) * _2,
+//    child(0)->grad(), child(0)->val(), adj_))};
+//  }
+//
+//  const std::string type() { return "scalar_pow2"; }
+//};
+//
+// struct Scalar1PowNodeOp : public UnaryNodeOp {
+// private:
+//  float scalar_{0};
+//
+// public:
+//  template <typename... Args>
+//  Scalar1PowNodeOp(float scalar, Expr a, Args... args)
+//      : UnaryNodeOp(a, args...), scalar_{scalar} {}
+//
+//  NodeOps forwardOps() {
+//    return {NodeOp(Element(_1 = Pow(scalar_, _2), val_, child(0)->val()))};
+//  }
+//
+//  NodeOps backwardOps() {
+//    return {NodeOp(Add(Pow(scalar_, _1) * log(scalar_) * _2, child(0)->grad(),
+//    child(0)->val(), adj_))};
+//  }
+//
+//  const std::string type() { return "scalar_pow1"; }
+//};
+
 struct TanhNodeOp : public NaryNodeOp {
   TanhNodeOp(const std::vector<Expr>& nodes)
       : NaryNodeOp(nodes, keywords::shape = newShape(nodes)) {}
 
   Shape newShape(const std::vector<Expr>& nodes) {
-    Shape shape = nodes[0]->shape();
-
-    for(int n = 1; n < nodes.size(); ++n) {
-      Shape shapen = nodes[n]->shape();
-      for(int i = 0; i < shapen.size(); ++i) {
-        UTIL_THROW_IF2(shape[i] != shapen[i] && shape[i] != 1 && shapen[i] != 1,
-                       "Shapes cannot be broadcasted");
-        shape.set(i, std::max(shape[i], shapen[i]));
-      }
-    }
-    return shape;
+    return Shape::broadcast(nodes);
   }
 
   NodeOps forwardOps() {
+    using namespace functional;
     switch(children_.size()) {
-      case 1: return {NodeOp(Element(_1 = Tanh(_2), val_, child(0)->val()))};
+      case 1: return {NodeOp(Element(_1 = tanh(_2), val_, child(0)->val()))};
       case 2:
         return {NodeOp(Element(
-            _1 = Tanh(_2 + _3), val_, child(0)->val(), child(1)->val()))};
+            _1 = tanh(_2 + _3), val_, child(0)->val(), child(1)->val()))};
       case 3:
-        return {NodeOp(Element(_1 = Tanh(_2 + _3 + _4),
+        return {NodeOp(Element(_1 = tanh(_2 + _3 + _4),
                                val_,
                                child(0)->val(),
                                child(1)->val(),
@@ -122,13 +189,14 @@ struct TanhNodeOp : public NaryNodeOp {
                          child(1)->val(),
                          child(2)->val());
                  for(int i = 3; i < children_.size(); ++i)
-                     Element(_1 += _2, val_, child(i)->val());
-                 Element(_1 = Tanh(_1), val_);)
+                     Element(_1 = _1 + _2, val_, child(i)->val());
+                 Element(_1 = tanh(_1), val_);)
         };
     }
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
     NodeOps ops;
     for(int i = 0; i < children_.size(); i++) {
       ops.push_back(
@@ -144,36 +212,142 @@ struct TanhNodeOp : public NaryNodeOp {
 
 /**
  * Represents a <a
-href="https://en.wikipedia.org/wiki/Rectifier_(neural_networks)">rectified
-linear</a> node
- *        in an expression graph.
+ * href="https://en.wikipedia.org/wiki/Rectifier_(neural_networks)">rectified
+ * linear</a> node in an expression graph.
  *
- * This node implements the <a
-href="https://en.wikipedia.org/wiki/Activation_function">activation function</a>
- *        \f$f(x) = \max(0, x)\f$ and its derivative:
- *
- \f[
- f^\prime(x) =
-  \begin{cases}
-   0 & \text{if } x \leq 0 \\
-   1 & \text{if } x > 0
-  \end{cases}
-\f]
+ * This node implements the activation function \f$ f(x) = \max(0, x) \f$ and
+ * its derivative:
+ * \f[
+ *   f^\prime(x) =
+ *   \begin{cases}
+ *     0 & \text{if } x \leq 0 \\
+ *     1 & \text{if } x > 0
+ *   \end{cases}
+ * \f]
  */
 struct ReLUNodeOp : public UnaryNodeOp {
   template <typename... Args>
   ReLUNodeOp(Args... args) : UnaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
-    return {NodeOp(Element(_1 = ReLU(_2), val_, child(0)->val()))};
+    // f(x) = max(0, x)
+    using namespace functional;
+    return {NodeOp(Element(_1 = ReLU(_2),
+                           val_,            // _1 := f(x) to be calculated
+                           child(0)->val()  // _2 := x
+                           ))};
   }
 
   NodeOps backwardOps() {
-    return {NodeOp(
-        Add(_1 * ReLUback(_2), child(0)->grad(), adj_, child(0)->val()))};
+    using namespace functional;
+    // dJ/dx += dJ/df * binarystep(x)
+    return {NodeOp(Add(_1 * ReLUback(_2),
+                       child(0)->grad(),  // dJ/dx
+                       adj_,              // _1 := dJ/df
+                       child(0)->val()    // _2 := f(x) = max(0, x)
+                       ))};
   }
 
   const std::string type() { return "ReLU"; }
+};
+
+/**
+ * Represents a <a
+ * href="https://en.wikipedia.org/wiki/Rectifier_(neural_networks)">parametric
+ * rectified linear unit</a> node in an expression graph.
+ * For \f$ \alpha = 0.01 \f$ (the default value) it is equivalent to Leaky
+ * ReLU.
+ *
+ * This node implements the activation function:
+ * \f[
+ *   f(x, \alpha) =
+ *   \begin{cases}
+ *     \alpha x & \text{if } x \leq 0 \\
+ *     x        & \text{if } x > 0
+ *   \end{cases}
+ * \f]
+ *
+ * and its derivative:
+ * \f[
+ *   f^\prime(x, \alpha) =
+ *   \begin{cases}
+ *     \alpha & \text{if } x \leq 0 \\
+ *     1      & \text{if } x > 0
+ *   \end{cases}
+ * \f]
+ */
+struct PReLUNodeOp : public UnaryNodeOp {
+  template <typename... Args>
+  PReLUNodeOp(float alpha, Args... args)
+      : UnaryNodeOp(args...), alpha_(alpha) {}
+
+  NodeOps forwardOps() {
+    using namespace functional;
+    return {NodeOp(Element(_1 = PReLU(_2, alpha_), val_, child(0)->val()))};
+  }
+
+  NodeOps backwardOps() {
+    using namespace functional;
+    return {NodeOp(Add(
+        _1 * PReLUback(_2, alpha_), child(0)->grad(), adj_, child(0)->val()))};
+  }
+
+  const std::string type() { return "PReLU"; }
+
+  virtual size_t hash() {
+    if(!hash_) {
+      hash_ = NaryNodeOp::hash();
+      boost::hash_combine(hash_, alpha_);
+    }
+    return hash_;
+  }
+
+  virtual bool equal(Expr node) {
+    if(!NaryNodeOp::equal(node))
+      return false;
+    auto cnode = std::dynamic_pointer_cast<PReLUNodeOp>(node);
+    if(!cnode)
+      return false;
+    if(alpha_ != cnode->alpha_)
+      return false;
+    return true;
+  }
+
+private:
+  float alpha_{0.01};
+};
+
+/**
+ * Represents a <a href="https://arxiv.org/pdf/1710.05941.pdf">swish</a> node
+ * in an expression graph.
+ *
+ * This node implements the activation function
+ * \f$ f(x) = x \cdot \sigma(x) \f$
+ * and its derivative
+ * \f$ f^\prime(x) = f(x) + \sigma(x)(1 - f(x)) \f$ .
+ *
+ */
+struct SwishNodeOp : public UnaryNodeOp {
+  template <typename... Args>
+  SwishNodeOp(Args... args) : UnaryNodeOp(args...) {}
+
+  NodeOps forwardOps() {
+    using namespace functional;
+    return {NodeOp(Element(_1 = _2 * logit(_2), val_, child(0)->val()))};
+  }
+
+  NodeOps backwardOps() {
+    using namespace functional;
+    // dJ/dx += dJ/df * ( f(x) + sigma(x) * (1 - f(x)) )
+    return {NodeOp(Add(_1 * (_3 + logit(_2) * (1.f - _3)),
+                       child(0)->grad(),  // dJ/dx
+                       adj_,              // _1 := dJ/df
+                       child(0)->val(),   // _2 := x
+                       val_               // _3 := f(x) = x*sigma(x)
+                       ))};
+  }
+
+  const std::string type() { return "swish"; }
 };
 
 struct SoftmaxNodeOp : public NaryNodeOp {
@@ -254,25 +428,23 @@ struct SumNodeOp : public UnaryNodeOp {
 
   template <typename... Args>
   SumNodeOp(Expr a, Args... args)
-      : UnaryNodeOp(a, keywords::shape = newShape(a, args...), args...),
-        ax_(keywords::Get(keywords::axis, -1, args...)) {}
+      : UnaryNodeOp(a, keywords::shape = newShape(a, args...), args...) {}
 
-  NodeOps forwardOps() { return {NodeOp(Reduce(_1, val_, child(0)->val()))}; }
+  NodeOps forwardOps() {
+    using namespace functional;
 
-  NodeOps backwardOps() { return {NodeOp(Add(_1, child(0)->grad(), adj_))}; }
+    return {NodeOp(Reduce(_1, val_, child(0)->val()))}; }
+
+  NodeOps backwardOps() {
+    using namespace functional;
+    return {NodeOp(Add(_1, child(0)->grad(), adj_))}; }
 
   template <class... Args>
   Shape newShape(Expr a, Args... args) {
-    int ax = keywords::Get(keywords::axis, -1, args...);
     Shape shape = a->shape();
-    if(ax != -1) {
-      shape.set(ax, 1);
-    } else {
-      shape.set(0, 1);
-      shape.set(1, 1);
-      shape.set(2, 1);
-      shape.set(3, 1);
-    }
+    ax_ = shape.axis(keywords::Get(keywords::axis, -1, args...));
+
+    shape.set(ax_, 1);
     return shape;
   }
 
@@ -305,35 +477,29 @@ struct MeanNodeOp : public UnaryNodeOp {
 
   template <typename... Args>
   MeanNodeOp(Expr a, Args... args)
-      : UnaryNodeOp(a, keywords::shape = newShape(a, args...), args...),
-        ax_(keywords::Get(keywords::axis, -1, args...)) {}
+      : UnaryNodeOp(a, keywords::shape = newShape(a, args...), args...) {}
 
   NodeOps forwardOps() {
+    using namespace functional;
     int left = child(0)->shape().elements() / val_->shape().elements();
     float scale = 1.f / left;
 
-    return {NodeOp(Reduce(_1, val_, child(0)->val(), scale))};
+    return {NodeOp(Reduce(_1, scale, val_, child(0)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
     int left = child(0)->shape().elements() / val_->shape().elements();
     float scale = 1.f / left;
 
-    return {NodeOp(Add(_1, child(0)->grad(), adj_, scale))};
+    return {NodeOp(Add(_1, scale, child(0)->grad(), adj_))};
   }
 
   template <class... Args>
   Shape newShape(Expr a, Args... args) {
-    int ax = keywords::Get(keywords::axis, -1, args...);
     Shape shape = a->shape();
-    if(ax != -1) {
-      shape.set(ax, 1);
-    } else {
-      shape.set(0, 1);
-      shape.set(1, 1);
-      shape.set(2, 1);
-      shape.set(3, 1);
-    }
+    ax_ = shape.axis(keywords::Get(keywords::axis, -1, args...));
+    shape.set(ax_, 1);
     return shape;
   }
 
@@ -366,10 +532,12 @@ struct LogNodeOp : public UnaryNodeOp {
   LogNodeOp(Args... args) : UnaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
-    return {NodeOp(Element(_1 = Log(_2), val_, child(0)->val()))};
+    using namespace functional;
+    return {NodeOp(Element(_1 = log(_2), val_, child(0)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
     return {
         NodeOp(Add(_1 * (1.f / _2), child(0)->grad(), adj_, child(0)->val()))};
   }
@@ -382,11 +550,13 @@ struct ExpNodeOp : public UnaryNodeOp {
   ExpNodeOp(Args... args) : UnaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
-    return {NodeOp(Element(_1 = Exp(_2), val_, child(0)->val()))};
+    using namespace functional;
+    return {NodeOp(Element(_1 = exp(_2), val_, child(0)->val()))};
   }
 
   NodeOps backwardOps() {
-    return {NodeOp(Add(_1 * Exp(_2), child(0)->grad(), adj_, child(0)->val()))};
+    using namespace functional;
+    return {NodeOp(Add(_1 * exp(_2), child(0)->grad(), adj_, child(0)->val()))};
   }
 
   const std::string type() { return "exp"; }
@@ -400,10 +570,12 @@ struct SqrtNodeOp : public UnaryNodeOp {
       : UnaryNodeOp(a, args...), epsilon_(epsilon) {}
 
   NodeOps forwardOps() {
-    return {NodeOp(Element(_1 = Sqrt(_2 + epsilon_), val_, child(0)->val()))};
+    using namespace functional;
+    return {NodeOp(Element(_1 = sqrt(_2 + epsilon_), val_, child(0)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
     return {NodeOp(Add(0.5f * (1.f / _1) * _2, child(0)->grad(), val_, adj_))};
   }
 
@@ -431,16 +603,16 @@ struct SqrtNodeOp : public UnaryNodeOp {
 };
 
 struct SquareNodeOp : public UnaryNodeOp {
-  float epsilon_;
-
   template <typename... Args>
   SquareNodeOp(Args... args) : UnaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
+    using namespace functional;
     return {NodeOp(Element(_1 = _2 * _2, val_, child(0)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
     return {
         NodeOp(Add(2.f * _1 * _2, child(0)->grad(), child(0)->val(), adj_))};
   }
@@ -453,10 +625,14 @@ struct NegNodeOp : public UnaryNodeOp {
   NegNodeOp(Args... args) : UnaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
+    using namespace functional;
     return {NodeOp(Element(_1 = -_2, val_, child(0)->val()))};
   }
 
-  NodeOps backwardOps() { return {NodeOp(Add(-_1, child(0)->grad(), adj_))}; }
+  NodeOps backwardOps() {
+    using namespace functional;
+    return {NodeOp(Add(-_1, child(0)->grad(), adj_))};
+  }
 
   const std::string type() { return "-"; }
 };
@@ -465,24 +641,24 @@ struct RowsNodeOp : public UnaryNodeOp {
   template <typename... Args>
   RowsNodeOp(Expr a, const std::vector<size_t>& indeces, Args... args)
       : UnaryNodeOp(a, keywords::shape = newShape(a, indeces), args...),
-        indeces_(indeces) {}
+        indices_(indeces) {}
 
   NodeOps forwardOps() {
     // @TODO: solve this with a tensor!
 
-    return {NodeOp(CopyRows(val_, child(0)->val(), indeces_))};
+    return {NodeOp(CopyRows(val_, child(0)->val(), indices_))};
   }
 
   NodeOps backwardOps() {
-    return {NodeOp(PasteRows(child(0)->grad(), adj_, indeces_))};
+    return {NodeOp(PasteRows(child(0)->grad(), adj_, indices_))};
   }
 
   template <class... Args>
   Shape newShape(Expr a, const std::vector<size_t>& indeces) {
     Shape shape = a->shape();
+    ABORT_IF(shape.size() != 2,
+             "rows operator can only be used with 2-dimensional tensors");
     shape.set(0, indeces.size());
-    shape.set(2, 1);
-    shape.set(3, 1);
     return shape;
   }
 
@@ -493,7 +669,7 @@ struct RowsNodeOp : public UnaryNodeOp {
   virtual size_t hash() {
     if(!hash_) {
       size_t seed = NaryNodeOp::hash();
-      for(auto i : indeces_)
+      for(auto i : indices_)
         boost::hash_combine(seed, i);
       hash_ = seed;
     }
@@ -506,28 +682,28 @@ struct RowsNodeOp : public UnaryNodeOp {
     Ptr<RowsNodeOp> cnode = std::dynamic_pointer_cast<RowsNodeOp>(node);
     if(!cnode)
       return false;
-    if(indeces_ != cnode->indeces_)
+    if(indices_ != cnode->indices_)
       return false;
     return true;
   }
 
-  std::vector<size_t> indeces_;
+  std::vector<size_t> indices_;
 };
 
 struct ColsNodeOp : public UnaryNodeOp {
   template <typename... Args>
   ColsNodeOp(Expr a, const std::vector<size_t>& indeces, Args... args)
       : UnaryNodeOp(a, keywords::shape = newShape(a, indeces), args...),
-        indeces_(indeces) {}
+        indices_(indeces) {}
 
   NodeOps forwardOps() {
     // @TODO: solve this with a tensor!
 
-    return {NodeOp(CopyCols(val_, child(0)->val(), indeces_))};
+    return {NodeOp(CopyCols(val_, child(0)->val(), indices_))};
   }
 
   NodeOps backwardOps() {
-    return {NodeOp(PasteCols(child(0)->grad(), adj_, indeces_))};
+    return {NodeOp(PasteCols(child(0)->grad(), adj_, indices_))};
   }
 
   template <class... Args>
@@ -544,7 +720,7 @@ struct ColsNodeOp : public UnaryNodeOp {
   virtual size_t hash() {
     if(!hash_) {
       size_t seed = NaryNodeOp::hash();
-      for(auto i : indeces_)
+      for(auto i : indices_)
         boost::hash_combine(seed, i);
       hash_ = seed;
     }
@@ -557,40 +733,116 @@ struct ColsNodeOp : public UnaryNodeOp {
     Ptr<ColsNodeOp> cnode = std::dynamic_pointer_cast<ColsNodeOp>(node);
     if(!cnode)
       return false;
-    if(indeces_ != cnode->indeces_)
+    if(indices_ != cnode->indices_)
       return false;
     return true;
   }
 
-  std::vector<size_t> indeces_;
+  std::vector<size_t> indices_;
 };
 
-struct TransposeNodeOp : public UnaryNodeOp {
-  template <typename... Args>
-  TransposeNodeOp(Expr a, Args... args)
-      : UnaryNodeOp(a, keywords::shape = newShape(a), args...) {}
+struct SelectNodeOp : public UnaryNodeOp {
+  SelectNodeOp(Expr a, int axis, const std::vector<size_t>& indeces)
+      : UnaryNodeOp(a, keywords::shape = newShape(a, axis, indeces)),
+        indices_(indeces) {}
 
   NodeOps forwardOps() {
-    return {NodeOp(Transpose(
-        std::static_pointer_cast<BackendGPU>(getBackend())->getCublasHandle(),
-        val_,
-        child(0)->val()))};
+    return {NodeOp(
+        Select(graph()->allocator(), val_, child(0)->val(), axis_, indices_))};
   }
 
   NodeOps backwardOps() {
-    return {NodeOp(Transpose(
-        std::static_pointer_cast<BackendGPU>(getBackend())->getCublasHandle(),
-        child(0)->grad(),
-        adj_))};
+    return {NodeOp(
+        Insert(graph()->allocator(), child(0)->grad(), adj_, axis_, indices_))};
+  }
+
+  Shape newShape(Expr a, int axis, const std::vector<size_t>& indeces) {
+    Shape shape = a->shape();
+    axis_ = shape.axis(axis);
+    shape.set(axis_, indeces.size());
+    return shape;
+  }
+
+  const std::string type() { return "select"; }
+
+  const std::string color() { return "orange"; }
+
+  virtual size_t hash() {
+    if(!hash_) {
+      size_t seed = NaryNodeOp::hash();
+      boost::hash_combine(seed, axis_);
+      for(auto i : indices_)
+        boost::hash_combine(seed, i);
+      hash_ = seed;
+    }
+    return hash_;
+  }
+
+  virtual bool equal(Expr node) {
+    if(!NaryNodeOp::equal(node))
+      return false;
+    Ptr<SelectNodeOp> cnode = std::dynamic_pointer_cast<SelectNodeOp>(node);
+    if(!cnode)
+      return false;
+    if(axis_ != cnode->axis_)
+      return false;
+    if(indices_ != cnode->indices_)
+      return false;
+    return true;
+  }
+
+  std::vector<size_t> indices_;
+  int axis_{0};
+};
+
+struct TransposeNodeOp : public UnaryNodeOp {
+  std::vector<int> axes_;
+
+  TransposeNodeOp(Expr a, const std::vector<int>& axes)
+      : UnaryNodeOp(a, keywords::shape = newShape(a, axes)),
+        axes_{axes} {}
+
+  NodeOps forwardOps() {
+    return {NodeOp(TransposeND(val_, child(0)->val(), axes_))};
+  }
+
+  NodeOps backwardOps() {
+    return {NodeOp(TransposeND(child(0)->grad(), adj_, axes_))};
   }
 
   template <class... Args>
-  Shape newShape(Expr a) {
+  Shape newShape(Expr a, const std::vector<int>& axes) {
     Shape shape = a->shape();
-    int temp = shape[0];
-    shape.set(0, shape[1]);
-    shape.set(1, temp);
+
+    ABORT_IF(shape.size() != axes.size(),
+            "Shape and transpose axes have different number of dimensions");
+
+    for(int i = 0; i < shape.size(); ++i)
+      shape.set(i, a->shape()[axes[i]]);
+
     return shape;
+  }
+
+  virtual size_t hash() {
+    if(!hash_) {
+      size_t seed = NaryNodeOp::hash();
+      for(auto ax : axes_)
+        boost::hash_combine(seed, ax);
+      hash_ = seed;
+    }
+    return hash_;
+  }
+
+  virtual bool equal(Expr node) {
+    if(!NaryNodeOp::equal(node))
+      return false;
+    Ptr<TransposeNodeOp> cnode
+        = std::dynamic_pointer_cast<TransposeNodeOp>(node);
+    if(!cnode)
+      return false;
+    if(axes_ != cnode->axes_)
+      return false;
+    return true;
   }
 
   const std::string type() { return "transpose"; }
@@ -661,23 +913,27 @@ public:
   }
 };
 
-class TimestepNodeOp : public UnaryNodeOp {
+class StepNodeOp : public UnaryNodeOp {
 private:
   Expr stepNode_;
-  size_t step_;
+  int step_;
+  int axis_;
 
 public:
-  TimestepNodeOp(Expr a, size_t step)
-      : UnaryNodeOp(a, keywords::shape = newShape(a)),
+  StepNodeOp(Expr a, int step, int axis)
+      : UnaryNodeOp(a, keywords::shape = newShape(a, axis)),
         stepNode_(a),
         step_(step) {
     Node::destroy_ = false;
   }
 
-  Shape newShape(Expr a) {
+  Shape newShape(Expr a, int axis) {
     Shape outShape = a->shape();
-    outShape.set(2, 1);
-    outShape.set(3, 1);
+
+    axis_ = outShape.axis(axis);
+    for(int i = 0; i <= axis_; ++i)
+      outShape.set(i, 1);
+
     return outShape;
   }
 
@@ -717,6 +973,7 @@ public:
     if(!hash_) {
       hash_ = NaryNodeOp::hash();
       boost::hash_combine(hash_, step_);
+      boost::hash_combine(hash_, axis_);
     }
     return hash_;
   }
@@ -724,10 +981,12 @@ public:
   virtual bool equal(Expr node) {
     if(!NaryNodeOp::equal(node))
       return false;
-    Ptr<TimestepNodeOp> cnode = std::dynamic_pointer_cast<TimestepNodeOp>(node);
+    Ptr<StepNodeOp> cnode = std::dynamic_pointer_cast<StepNodeOp>(node);
     if(!cnode)
       return false;
     if(step_ != cnode->step_)
+      return false;
+    if(axis_ != cnode->axis_)
       return false;
     return true;
   }
@@ -772,7 +1031,7 @@ struct ShiftNodeOp : public UnaryNodeOp {
   Shape shift_;
 };
 
-//struct LexicalProbNodeOp : public NaryNodeOp {
+// struct LexicalProbNodeOp : public NaryNodeOp {
 //  template <typename... Args>
 //  LexicalProbNodeOp(
 //      Expr logits, Expr att, float eps, Ptr<sparse::CSR> lf, Args... args)
@@ -783,13 +1042,13 @@ struct ShiftNodeOp : public UnaryNodeOp {
 //  void forward() {
 //    sparse::LfaForward(val_, child(0)->val(), child(1)->val(), lf_);
 //    // val = x + ln(p + eps)
-//    Element(_1 = (Log(_1 + eps_) + _2), val_, child(0)->val());
+//    Element(_1 = (log(_1 + eps_) + _2), val_, child(0)->val());
 //  }
 //
 //  void backward() {
 //    Add(_1, child(0)->grad(), adj_);
 //    // adj' = adj / (p + eps) = adj / exp(val - x)
-//    Element(_1 = _1 / Exp(_2 - _3), adj_, val_, child(0)->val());
+//    Element(_1 = _1 / exp(_2 - _3), adj_, val_, child(0)->val());
 //    sparse::LfaBackward(child(1)->grad(), adj_, lf_);
 //  }
 //
@@ -808,132 +1067,84 @@ struct ShiftNodeOp : public UnaryNodeOp {
 //  Ptr<sparse::CSR> lf_;
 //};
 
-#ifdef CUDNN
-
 class PoolingOp : public UnaryNodeOp {
+public:
+  PoolingOp(Expr x,
+            int height,
+            int width,
+            int padHeight,
+            int padWidth,
+            int strideHeight,
+            int strideWidth,
+            std::string mode)
+      : UnaryNodeOp(x),
+        pooling_(height,
+                 width,
+                 padHeight,
+                 padWidth,
+                 strideHeight,
+                 strideWidth,
+                 mode) {
+  }
+
+  NodeOps forwardOps() {
+    return {NodeOp(pooling_.forward(child(0)->val(), val_))};
+  }
+
+  NodeOps backwardOps() {
+    return {NodeOp(pooling_.backward(
+          child(0)->val(),
+          child(0)->grad(),
+          val_,
+          adj_))};
+  }
+
+  const std::string type() { return "layer_pooling"; }
+
+
+protected:
+  PoolingWrapper pooling_;
+};
+
+class PoolingWithMaskingOp : public UnaryNodeOp {
   public:
-    enum class Mode {MAX_POOLING, AVERAGE_POOLING};
-
-    PoolingOp(
-        Expr x,
-        int height, int width,
-        int padHeight, int padWidth,
-        int strideHeight, int strideWidth,
-        Mode mode = Mode::AVERAGE_POOLING)
-      : UnaryNodeOp(x)
+    PoolingWithMaskingOp( Expr x, Expr mask, int width, bool isEven=false)
+      : UnaryNodeOp(x),
+        mask_(mask),
+        width_(width),
+        isEven_(isEven)
     {
-      CUDNN_CALL( cudnnCreate(&cudnnHandle_) );
-
-
-      CUDNN_CALL( cudnnCreateTensorDescriptor(&xDesc_) );
-      CUDNN_CALL( cudnnSetTensor4dDescriptor(xDesc_,
-                                CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                                x->shape()[0], x->shape()[1],
-                                x->shape()[2], x->shape()[3]
-      ));
-
-
-      cudnnPoolingMode_t cudnnPoolingMode;
-      switch (mode) {
-        case Mode::MAX_POOLING:
-          cudnnPoolingMode = CUDNN_POOLING_MAX;
-          break;
-        case Mode::AVERAGE_POOLING:
-          cudnnPoolingMode = CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING;
-          break;
-        default:
-          break;
-      };
-
-      height = std::min(height, x->shape()[2]);
-      strideHeight = std::min(strideHeight, x->shape()[2]);
-
-      CUDNN_CALL( cudnnCreatePoolingDescriptor(&poolingDesc_) );
-      CUDNN_CALL( cudnnSetPooling2dDescriptor(poolingDesc_,
-            cudnnPoolingMode,
-            CUDNN_NOT_PROPAGATE_NAN,
-            height, width,
-            padHeight, padWidth,
-            strideHeight, strideWidth
-      ));
-
-      CUDNN_CALL(cudnnGetPooling2dForwardOutputDim(
-            poolingDesc_,
-            xDesc_,
-            shape_.begin(), shape_.begin() + 1, shape_.begin() + 2, shape_.begin() + 3
-      ));
-
-      CUDNN_CALL( cudnnCreateTensorDescriptor(&yDesc_) );
-      CUDNN_CALL( cudnnSetTensor4dDescriptor(yDesc_,
-                                CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                                shape_[0], shape_[1],
-                                shape_[2], shape_[3])
-      );
-      CUDNN_CALL( cudnnCreateTensorDescriptor(&adjDesc_) );
-      CUDNN_CALL( cudnnSetTensor4dDescriptor(adjDesc_,
-                                CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                                shape_[0], shape_[1],
-                                shape_[2], shape_[3])
-      );
+      auto xShape = x->shape();
+      int dimBatch = xShape[0];
+      int dimWord = xShape[1];
+      int cols = (isEven_) ? xShape[2] - 1 : xShape[2];
+      int dimSentence = (cols / width_) + (cols % width_ != 0);
+      shape_ = {dimBatch, dimWord, dimSentence};
     }
 
-
     NodeOps forwardOps() {
-      const float alpha = 1.0f;
-      const float beta = 0.0f;
-
-      cudaSetDevice(val_->getDevice());
-
-      return {
-        NodeOp(
-          CUDNN_CALL( cudnnPoolingForward(cudnnHandle_,
-                        poolingDesc_,
-                        &alpha,
-                        xDesc_, children_[0]->val()->data(),
-                        &beta,
-                        yDesc_, val_->data()))
-          )
-      };
+      return {NodeOp(PoolingWithMaskingForward(val_,
+                                              child(0)->val(),
+                                              mask_->val(),
+                                              width_,
+                                              isEven_))};
     }
 
     NodeOps backwardOps() {
-      cudaSetDevice(adj_->getDevice());
-      const float alpha = 1.0f;
-      const float beta = 1.0f;
-      return {
-        NodeOp(
-          CUDNN_CALL( cudnnPoolingBackward(cudnnHandle_,
-                        poolingDesc_,
-                        &alpha,
-                        yDesc_, val_->data(),
-                        adjDesc_, adj_->data(),
-                        xDesc_, children_[0]->val()->data(),
-                        &beta,
-                        xDesc_, children_[0]->grad()->data()
-          )))
-      };
+      return {NodeOp(PoolingWithMaskingBackward(adj_,
+                                               child(0)->grad(),
+                                               child(0)->val(),
+                                               mask_->val(),
+                                               width_,
+                                               isEven_))};
     }
 
-    const std::string type() {
-      return "layer_max_pooling";
-    }
-
-    virtual ~PoolingOp() {
-      CUDNN_CALL( cudnnDestroy(cudnnHandle_) );
-      CUDNN_CALL( cudnnDestroyPoolingDescriptor(poolingDesc_) );
-      CUDNN_CALL( cudnnDestroyTensorDescriptor(xDesc_) );
-      CUDNN_CALL( cudnnDestroyTensorDescriptor(yDesc_) );
-      CUDNN_CALL( cudnnDestroyTensorDescriptor(adjDesc_) );
-    }
+    const std::string type() {return "layer_pooling";}
 
   protected:
-    cudnnHandle_t cudnnHandle_;
-    cudnnPoolingDescriptor_t poolingDesc_;
-    cudnnTensorDescriptor_t xDesc_;
-    cudnnTensorDescriptor_t yDesc_;
-    cudnnTensorDescriptor_t adjDesc_;
-
+    Expr mask_;
+    int width_;
+    bool isEven_;
 };
 
-#endif
 }

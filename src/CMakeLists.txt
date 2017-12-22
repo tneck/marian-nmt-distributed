@@ -13,10 +13,16 @@ cuda_add_library(marian
   graph/node_operators.cu
   tensors/tensor.cu
   tensors/device_gpu.cu
+  tensors/memory_piece.cu
   kernels/tensor_operators.cu
   kernels/dropout.cu
-  kernels/sparse.cu
+  kernels/cudnn_wrappers.cu
+#  kernels/sparse.cu
   layers/param_initializers.cu
+  layers/generic.cpp
+  layers/guided_alignment.cpp
+  layers/convolution.cu
+  models/model_factory.cpp
   rnn/attention.cu
   rnn/cells.cu
   optimizers/clippers.cu
@@ -29,8 +35,16 @@ cuda_add_library(marian
   translator/output_collector.cpp
   translator/nth_element.cu
   translator/helpers.cu
+  translator/scorers.cpp
+  training/dropper.cu
+  training/graph_group_async.cu
+  training/graph_group_async_drop.cu
+  training/graph_group_sync.cu
+  training/graph_group_singleton.cu
   training/graph_group_multinode.cu
   training/graph_group_multinode_sparse.cu
+  training/sparse_tensor.cu
+  training/validator.cpp
   data/vocab.cpp
   data/corpus.cpp
   data/text_input.cpp
@@ -42,20 +56,23 @@ cuda_add_library(marian
 set_target_properties(marian PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 set_target_properties(marian PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
-cuda_add_executable(marian_train command/marian.cu)
+add_executable(marian_train command/marian.cpp)
 set_target_properties(marian_train PROPERTIES OUTPUT_NAME marian)
 
-add_executable(marian_translate command/s2s_translator.cpp)
-set_target_properties(marian_translate PROPERTIES OUTPUT_NAME s2s)
+add_executable(marian_decoder command/marian_decoder.cpp)
+set_target_properties(marian_decoder PROPERTIES OUTPUT_NAME marian-decoder)
 
-add_executable(marian_rescore command/s2s_rescorer.cpp)
-set_target_properties(marian_rescore PROPERTIES OUTPUT_NAME rescorer)
+add_executable(marian_scorer command/marian_scorer.cpp)
+set_target_properties(marian_scorer PROPERTIES OUTPUT_NAME marian-scorer)
 
-set(EXECUTABLES ${EXECUTABLES} marian_train marian_translate marian_rescore)
+add_executable(marian_vocab command/marian_vocab.cpp)
+set_target_properties(marian_vocab PROPERTIES OUTPUT_NAME marian-vocab)
+
+set(EXECUTABLES ${EXECUTABLES} marian_train marian_decoder marian_scorer marian_vocab)
 
 if(COMPILE_SERVER)
-  add_executable(marian_server command/s2s_server.cpp)
-  set_target_properties(marian_server PROPERTIES OUTPUT_NAME server)
+  add_executable(marian_server command/marian_server.cpp)
+  set_target_properties(marian_server PROPERTIES OUTPUT_NAME marian-server)
   set(EXECUTABLES ${EXECUTABLES} marian_server)
 endif(COMPILE_SERVER)
 

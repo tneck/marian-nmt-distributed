@@ -1,9 +1,10 @@
 #include "training/graph_group_multinode.h"
 
+#include "kernels/tensor_operators.h"
+
 namespace marian {
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::setScheduler(Ptr<Scheduler<dataset_type>> scheduler) {
+void MultiNodeGraphGroup::setScheduler(Ptr<Scheduler> scheduler) {
   scheduler_ = scheduler;
   // optimizer has to be registered last to see a change of learning rate
   scheduler_->registerTrainingObserver(scheduler_);
@@ -13,8 +14,7 @@ void MultiNodeGraphGroup<Builder>::setScheduler(Ptr<Scheduler<dataset_type>> sch
   }
 }
 
-template <class Builder>
-Tensor MultiNodeGraphGroup<Builder>::newTensor(int size, int device) {
+Tensor MultiNodeGraphGroup::newTensor(int size, int device) {
   Tensor t;
   Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
   allocator->reserveExact(size * sizeof(float));
@@ -23,8 +23,7 @@ Tensor MultiNodeGraphGroup<Builder>::newTensor(int size, int device) {
   return t;
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::initFirstRun(Ptr<data::Batch> batch) {
+void MultiNodeGraphGroup::initFirstRun(Ptr<data::Batch> batch) {
   // Initialize client graphs (incl. params) and builders
   for (size_t i = 0; i < graphs_.size(); ++i) {
     THREAD_GUARD(
@@ -45,16 +44,14 @@ void MultiNodeGraphGroup<Builder>::initFirstRun(Ptr<data::Batch> batch) {
   }
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::initMPI() {
+void MultiNodeGraphGroup::initMPI() {
 #if MPI_FOUND
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_comm_world_size_);
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_my_rank_);
 #endif
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::initServerShard(bool initFullSendReceiveBuffer) {
+void MultiNodeGraphGroup::initServerShard(bool initFullSendReceiveBuffer) {
   // Initialize server shard sizes for all nodes (remote + current)
   size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
   size_t nodeShardSize = ceilf(((float) totalParamsGradsSize) / mpi_comm_world_size_);
@@ -86,17 +83,16 @@ void MultiNodeGraphGroup<Builder>::initServerShard(bool initFullSendReceiveBuffe
   }
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::setupClientsOfNodesAndDevices() {
+void MultiNodeGraphGroup::setupClientsOfNodesAndDevices() {
   int index = 0, node = 0, nClientsSeen = 0;
   numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_, 0);
   while (index < multiNodeDevices_.size()) {
     if (numberClientsOfNodes_[node] == 0) {
-      numberClientsOfNodes_[node] = multiNodeDevices_[index];
+      numberClientsOfNodes_[node] = (size_t) multiNodeDevices_[index];
       nClientsSeen = 0;
     } else if (nClientsSeen < numberClientsOfNodes_[node]) {
       if (node == mpi_my_rank_) {
-        devices_.push_back(multiNodeDevices_[index]);
+        devices_.push_back((size_t)multiNodeDevices_[index]);
       }
       nClientsSeen++;
     } else {
@@ -107,8 +103,7 @@ void MultiNodeGraphGroup<Builder>::setupClientsOfNodesAndDevices() {
   }
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::initRemoteCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
+void MultiNodeGraphGroup::initRemoteCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
   for (int gpu = 0; gpu < devices_.size(); gpu++) {
     if (initBuffers) {
       size_t size = nodeShardSizes_[mpi_my_rank_];
@@ -119,7 +114,7 @@ void MultiNodeGraphGroup<Builder>::initRemoteCommunicationVars(bool initBuffers)
       size_t fullSize = graphs_[0]->params()->vals()->size();
       // Running sum of gradients
       Tensor sumGrads = newTensor(fullSize, devices_[gpu]);
-      Element(_1 = 0, sumGrads);
+      Element(functional::_1 = 0, sumGrads);
       cudaStreamSynchronize(0);
       gpuSummedGrads_.push_back(sumGrads);
       // Communication gradients buffer
@@ -132,8 +127,7 @@ void MultiNodeGraphGroup<Builder>::initRemoteCommunicationVars(bool initBuffers)
   }
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::launchServerShardThread() {
+void MultiNodeGraphGroup::launchServerShardThread() {
 #if MPI_FOUND
   serverShardThread_ = new std::thread([this] {
     int nCommunicatingNodes = mpi_comm_world_size_; // keep track of number of nodes still communicating with this shard
@@ -162,8 +156,8 @@ void MultiNodeGraphGroup<Builder>::launchServerShardThread() {
           cudaStreamSynchronize(0);
 
           // Run optimizer on GPU
-          if (scale_lr && batchWords > 0) {
-            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords / average_batch_words);
+          if (scaleLearningRate_ && batchWords > 0) {
+            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords / avgBatchWords_);
           } else {
             gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
           }
@@ -186,8 +180,7 @@ void MultiNodeGraphGroup<Builder>::launchServerShardThread() {
 #endif
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords, std::mutex *optionalBlockMutex) {
+void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords, std::mutex *optionalBlockMutex) {
   #if MPI_FOUND
   size_t offset = 0;
   for (int node = 0; node < mpi_comm_world_size_; node++) {
@@ -236,8 +229,8 @@ void MultiNodeGraphGroup<Builder>::synchronizeWithServerShards(Tensor newGrads, 
           // Copy grads to appropriate GPU
           gpuShardsGrads_[gpu]->copyFrom(newGrads->subtensor(offset, size));
           // Run optimizer on GPU
-          if (scale_lr && batchWords > 0) {
-            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords / average_batch_words);
+          if (scaleLearningRate_ && batchWords > 0) {
+            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords / avgBatchWords_);
           } else {
             gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
           }
@@ -256,8 +249,7 @@ void MultiNodeGraphGroup<Builder>::synchronizeWithServerShards(Tensor newGrads, 
   #endif
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::launchCommOverlapThreads() {
+void MultiNodeGraphGroup::launchCommOverlapThreads() {
 #if MPI_FOUND
   for (int gpu = 0; gpu < devices_.size(); gpu++) {
     clientCommThreads_.emplace_back(new std::thread([this](int gpu) {
@@ -271,7 +263,7 @@ void MultiNodeGraphGroup<Builder>::launchCommOverlapThreads() {
         if (stopClientCommThreads_) { break; }
 
         // Synchronize with server shards
-        synchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, scale_lr ? gpuCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
+        synchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, scaleLearningRate_ ? gpuCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
 
         // Indicate that buffers can be read from and filled again
         commBuffersFilled_[gpu] = false;
@@ -282,8 +274,7 @@ void MultiNodeGraphGroup<Builder>::launchCommOverlapThreads() {
 #endif
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
+void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
   if (!firstBatchProcessed_) {
     initFirstRun(batch);
     firstBatchProcessed_ = true;
@@ -292,7 +283,7 @@ void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
   auto task = [this](Ptr<data::Batch> batch) {
     static size_t i = 0;
     thread_local Ptr<ExpressionGraph> graph;
-    thread_local Ptr<Builder> builder;
+    thread_local Ptr<models::ModelBase> builder;
     thread_local size_t t = 0;
     thread_local size_t numSeenWords = 0;
 
@@ -326,7 +317,7 @@ void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
         accGradients->set(0);
       }
 
-      Element(_1 += _2, accGradients, graph->params()->grads());
+      Element(functional::_1 += functional::_2, accGradients, graph->params()->grads());
       gradients = accGradients;
       numSeenWords += batchWords; // Keep track of how many words we've calculated the error from
     } else {
@@ -365,7 +356,7 @@ void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
         boost::upgrade_to_unique_lock<boost::shared_mutex> uniqueLock(lock);
         //if(movingAvg_)
         //  fetchParams(graph->params()->vals(), paramsAvg_);
-        scheduler_->validate(graph);
+        scheduler_->validate(graphs_);
       }
     }
 
@@ -373,10 +364,10 @@ void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
     if (commOverlap_) {
 
       // Add computed gradients to local running sum
-      Element(_1 = _1 + _2, gpuSummedGrads_[my_id], gradients);
+      Element(functional::_1 = functional::_1 + functional::_2, gpuSummedGrads_[my_id], gradients);
       cudaStreamSynchronize(0);
       // Sum up word counts if batch flexible learning rate is enabled
-      if (scale_lr) {
+      if (scaleLearningRate_) {
         gpuSummedWordCounts_[my_id] += numSeenWords;
       }
 
@@ -397,7 +388,7 @@ void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
           graph->params()->vals()->copyFrom(commBufferParams_[my_id]);
 
           // Commit summed word counts if batch-flexible-lr enabled
-          if (scale_lr) {
+          if (scaleLearningRate_) {
             gpuCommittedWordCounts_[my_id] = gpuSummedWordCounts_[my_id];
             gpuSummedWordCounts_[my_id] = 0;
           }
@@ -410,7 +401,7 @@ void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
           localOpts_[my_id]->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
           cudaStreamSynchronize(0);
           // Clear summed gradients
-          Element(_1 = 0, gpuSummedGrads_[my_id]);
+          Element(functional::_1 = 0, gpuSummedGrads_[my_id]);
           cudaStreamSynchronize(0);
 
           numberComputeIters_[my_id] = 0;
@@ -425,8 +416,7 @@ void MultiNodeGraphGroup<Builder>::execute(Ptr<data::Batch> batch) {
   pool_->enqueue(task, batch);
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::signalFinishedToServerShards() {
+void MultiNodeGraphGroup::signalFinishedToServerShards() {
   #if MPI_FOUND
   unsigned long messageInfo[4];
   messageInfo[MSG_INFO_STATUS_] = STATUS_NODE_FINISHED_;
@@ -436,13 +426,11 @@ void MultiNodeGraphGroup<Builder>::signalFinishedToServerShards() {
   #endif
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::shutDownServerShardThread() {
+void MultiNodeGraphGroup::shutDownServerShardThread() {
   serverShardThread_->join(); // Wait for server thread to finish communicating (with unfinished nodes)
 }
 
-template <class Builder>
-void MultiNodeGraphGroup<Builder>::shutDownCommOverlapThreads() {
+void MultiNodeGraphGroup::shutDownCommOverlapThreads() {
   stopClientCommThreads_ = true;
   for (int gpu = 0; gpu < devices_.size(); gpu++) {
     commBuffersFilled_[gpu] = true;

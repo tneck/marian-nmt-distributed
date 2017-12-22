@@ -9,29 +9,34 @@
 
 #include <sys/stat.h>
 
-#include "exception.h"
+#include "3rd_party/exception.h"
+#include "common/logging.h"
 
 namespace io = boost::iostreams;
 
 class TemporaryFile {
 private:
   int fd_;
+  bool unlink_;
+  std::string name_;
 
   int mkstemp_and_unlink(char* tmpl) {
     int ret = mkstemp(tmpl);
-    if(ret != -1) {
-      UTIL_THROW_IF2(unlink(tmpl), "while deleting " << tmpl);
+    if(unlink_ && ret != -1) {
+      ABORT_IF(unlink(tmpl), "Error while deleting '{}'", tmpl);
     }
     return ret;
   }
 
   int MakeTemp(const std::string& base) {
     std::string name(base);
-    name += "XXXXXX";
+    name += "marian.XXXXXX";
     name.push_back(0);
     int ret;
-    UTIL_THROW_IF2(-1 == (ret = mkstemp_and_unlink(&name[0])),
-                   "while making a temporary based on " << base);
+    ABORT_IF(-1 == (ret = mkstemp_and_unlink(&name[0])),
+             "Error while making a temporary based on '{}'",
+             base);
+    name_ = name;
     return ret;
   }
 
@@ -49,13 +54,17 @@ private:
   }
 
 public:
-  TemporaryFile(const std::string base = "/tmp/") {
+  TemporaryFile(const std::string base = "/tmp/", bool earlyUnlink = true)
+      : unlink_(earlyUnlink) {
     std::string baseTemp(base);
     NormalizeTempPrefix(baseTemp);
     fd_ = MakeTemp(baseTemp);
   }
 
   ~TemporaryFile() {
+    if(fd_ != -1 && !unlink_) {
+      ABORT_IF(unlink(name_.c_str()), "Error while deleting '{}'", name_);
+    }
     if(fd_ != -1 && close(fd_)) {
       std::cerr << "Could not close file " << fd_ << std::endl;
       std::abort();
@@ -63,13 +72,15 @@ public:
   }
 
   int getFileDescriptor() { return fd_; }
+
+  std::string getFileName() { return name_; }
 };
 
 class InputFileStream {
 public:
   InputFileStream(const std::string& file) : file_(file), ifstream_(file_) {
-    UTIL_THROW_IF2(!boost::filesystem::exists(file_),
-                   "File " << file << " does not exist");
+    ABORT_IF(
+        !boost::filesystem::exists(file_), "File '{}' does not exist", file);
 
     if(file_.extension() == ".gz")
       istream_.push(io::gzip_decompressor());
@@ -96,9 +107,7 @@ public:
 
   std::string path() { return file_.string(); }
 
-  bool empty() {
-    return ifstream_.peek() == std::ifstream::traits_type::eof();
-  }
+  bool empty() { return ifstream_.peek() == std::ifstream::traits_type::eof(); }
 
 private:
   boost::filesystem::path file_;
@@ -110,8 +119,8 @@ private:
 class OutputFileStream {
 public:
   OutputFileStream(const std::string& file) : file_(file), ofstream_(file_) {
-    UTIL_THROW_IF2(!boost::filesystem::exists(file_),
-                   "File " << file << " does not exist");
+    ABORT_IF(
+        !boost::filesystem::exists(file_), "File '{}' does not exist", file);
 
     if(file_.extension() == ".gz")
       ostream_.push(io::gzip_compressor());

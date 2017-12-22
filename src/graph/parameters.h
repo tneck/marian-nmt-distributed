@@ -51,8 +51,7 @@ public:
 
   void add(Expr p, const std::string& name) {
     params_.push_back(p);
-    UTIL_THROW_IF2(named_.count(name),
-                   "Parameter " << name << "already exists");
+    ABORT_IF(named_.count(name), "Parameter '{}' already exists", name);
     named_[name] = p;
   }
 
@@ -79,22 +78,6 @@ public:
   Tensor vals() { return vals_->asTensor(); }
 
   Tensor grads() { return grads_->asTensor(); }
-
-  Ptr<TensorAllocator> getValsAlloc() {
-    return vals_;
-  }
-
-  void setValsAlloc(Ptr<TensorAllocator> valsAlloc) {
-    vals_ = valsAlloc;
-  }
-
-  Ptr<TensorAllocator> getGradsAlloc() {
-    return grads_;
-  }
-
-  void setGradsAlloc(Ptr<TensorAllocator> gradsAlloc) {
-    grads_ = gradsAlloc;
-  }
 
   void clear() {
     params_.clear();

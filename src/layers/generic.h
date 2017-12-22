@@ -8,9 +8,9 @@
 #include "layers/param_initializers.h"
 
 namespace marian {
-  namespace mlp {
-    enum struct act : int { linear, tanh, logit, ReLU };
-  }
+namespace mlp {
+enum struct act : int { linear, tanh, logit, ReLU, LeakyReLU, PReLU, swish };
+}
 }
 
 YAML_REGISTER_TYPE(marian::mlp::act, int)
@@ -25,8 +25,7 @@ protected:
 
 public:
   Layer(Ptr<ExpressionGraph> graph, Ptr<Options> options)
-   : graph_(graph), options_(options)
-  {}
+      : graph_(graph), options_(options) {}
 
   template <typename T>
   T opt(const std::string key) {
@@ -49,7 +48,7 @@ private:
 
 public:
   Dense(Ptr<ExpressionGraph> graph, Ptr<Options> options)
-   : Layer(graph, options) {}
+      : Layer(graph, options) {}
 
   void tie(const std::string& param, const std::string& tied) {
     tiedParams_[param] = graph_->get(tied);
@@ -60,15 +59,16 @@ public:
   }
 
   Expr apply(const std::vector<Expr>& inputs) {
-    UTIL_THROW_IF2(inputs.empty(), "No inputs");
+    ABORT_IF(inputs.empty(), "No inputs");
 
     if(inputs.size() == 1)
       return apply(inputs[0]);
 
     auto name = opt<std::string>("prefix");
-    auto dim  = opt<int>("dim");
+    auto dim = opt<int>("dim");
 
     auto layerNorm = opt<bool>("layer-normalization", false);
+    auto nematusNorm = opt<bool>("nematus-normalization", false);
     auto activation = opt<act>("activation", act::linear);
 
     auto g = graph_;
@@ -83,7 +83,7 @@ public:
         W = tiedParams_[nameW];
       else
         W = g->param(name + "_" + nameW,
-                     {in->shape()[1], dim},
+                     {in->shape()[-1], dim},
                      keywords::init = inits::glorot_uniform);
 
       Expr b;
@@ -91,20 +91,32 @@ public:
       if(tiedParams_.count(nameB))
         b = tiedParams_[nameB];
       else
-        b = g->param(name + "_" + nameB,
-                     {1, dim},
-                     keywords::init = inits::zeros);
+        b = g->param(
+            name + "_" + nameB, {1, dim}, keywords::init = inits::zeros);
 
       params_.push_back(W);
       params_.push_back(b);
 
       if(layerNorm) {
-        auto gamma = g->param(name + "_gamma" + std::to_string(i),
-                              {1, dim},
-                              keywords::init = inits::from_value(1.0));
+        if(nematusNorm) {
+          auto ln_s = g->param(name + "_ln_s" + std::to_string(i),
+                               {1, dim},
+                               keywords::init = inits::from_value(1.f));
+          auto ln_b = g->param(name + "_ln_b" + std::to_string(i),
+                               {1, dim},
+                               keywords::init = inits::zeros);
 
-        params_.push_back(gamma);
-        outputs.push_back(layer_norm(dot(in, W), gamma, b));
+          outputs.push_back(
+              layer_norm(affine(in, W, b), ln_s, ln_b, NEMATUS_LN_EPS));
+        } else {
+          auto gamma = g->param(name + "_gamma" + std::to_string(i),
+                                {1, dim},
+                                keywords::init = inits::from_value(1.0));
+
+          params_.push_back(gamma);
+          outputs.push_back(layer_norm(dot(in, W), gamma, b));
+        }
+
       } else {
         outputs.push_back(affine(in, W, b));
       }
@@ -116,6 +128,9 @@ public:
       case act::tanh: return tanh(outputs);
       case act::logit: return logit(outputs);
       case act::ReLU: return relu(outputs);
+      case act::LeakyReLU: return leakyrelu(outputs);
+      case act::PReLU: return prelu(outputs);
+      case act::swish: return swish(outputs);
       default: return plus(outputs);
     }
   };
@@ -124,9 +139,10 @@ public:
     auto g = graph_;
 
     auto name = options_->get<std::string>("prefix");
-    auto dim  = options_->get<int>("dim");
+    auto dim = options_->get<int>("dim");
 
     auto layerNorm = options_->get<bool>("layer-normalization", false);
+    auto nematusNorm = opt<bool>("nematus-normalization", false);
     auto activation = options_->get<act>("activation", act::linear);
 
     Expr W;
@@ -135,7 +151,7 @@ public:
       W = tiedParams_[nameW];
     else
       W = g->param(name + "_" + nameW,
-                   {input->shape()[1], dim},
+                   {input->shape()[-1], dim},
                    keywords::init = inits::glorot_uniform);
 
     Expr b;
@@ -143,20 +159,26 @@ public:
     if(tiedParams_.count(nameB))
       b = tiedParams_[nameB];
     else
-      b = g->param(name + "_" + nameB,
-                   {1, dim},
-                   keywords::init = inits::zeros);
+      b = g->param(name + "_" + nameB, {1, dim}, keywords::init = inits::zeros);
 
     params_ = {W, b};
 
     Expr out;
     if(layerNorm) {
-      auto gamma = g->param(name + "_gamma",
-                            {1, dim},
-                            keywords::init = inits::from_value(1.0));
+      if(nematusNorm) {
+        auto ln_s = g->param(
+            name + "_ln_s", {1, dim}, keywords::init = inits::from_value(1.f));
+        auto ln_b
+            = g->param(name + "_ln_b", {1, dim}, keywords::init = inits::zeros);
 
-      params_.push_back(gamma);
-      out = layer_norm(dot(input, W), gamma, b);
+        out = layer_norm(affine(input, W, b), ln_s, ln_b, NEMATUS_LN_EPS);
+      } else {
+        auto gamma = g->param(
+            name + "_gamma", {1, dim}, keywords::init = inits::from_value(1.0));
+
+        params_.push_back(gamma);
+        out = layer_norm(dot(input, W), gamma, b);
+      }
     } else {
       out = affine(input, W, b);
     }
@@ -166,12 +188,15 @@ public:
       case act::tanh: return tanh(out);
       case act::logit: return logit(out);
       case act::ReLU: return relu(out);
+      case act::LeakyReLU: return leakyrelu(out);
+      case act::PReLU: return prelu(out);
+      case act::swish: return swish(out);
       default: return out;
     }
   }
 };
 
-} // namespace mlp
+}  // namespace mlp
 
 struct EmbeddingFactory : public Factory {
   EmbeddingFactory(Ptr<ExpressionGraph> graph) : Factory(graph) {}
@@ -192,7 +217,8 @@ struct EmbeddingFactory : public Factory {
       }
     }
 
-    return graph_->param(name, {dimVoc, dimEmb},
+    return graph_->param(name,
+                         {dimVoc, dimEmb},
                          keywords::init = initFunc,
                          keywords::fixed = fixed);
   }
@@ -200,21 +226,9 @@ struct EmbeddingFactory : public Factory {
 
 typedef Accumulator<EmbeddingFactory> embedding;
 
-class CrossEntropyCost {
-public:
-  CrossEntropyCost(const std::string name) {}
-
-  template <typename... Args>
-  Expr operator()(Expr in, Expr picks, Args... args) {
-    auto mask = Get(keywords::mask, nullptr, args...);
-
-    auto ce = cross_entropy(in, picks);
-
-    if(mask)
-      ce = ce * mask;
-
-    auto cost = mean(sum(ce, keywords::axis = 2), keywords::axis = 0);
-    return cost;
-  }
-};
+Expr Cost(Expr logits,
+          Expr indices,
+          Expr mask,
+          std::string costType = "cross-entropy",
+          float smoothing = 0);
 }

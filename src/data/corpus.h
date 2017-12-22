@@ -70,13 +70,43 @@ public:
   size_t batchWidth() { return width_; };
   size_t batchWords() { return words_; }
 
+  std::vector<Ptr<SubBatch>> split(size_t n) {
+    std::vector<Ptr<SubBatch>> splits;
+
+    size_t subSize = std::ceil(size_ / (float)n);
+    size_t totSize = size_;
+
+    int pos = 0;
+    for(int k = 0; k < n; ++k) {
+      size_t __size__ = std::min(subSize, totSize);
+
+      auto sb = New<SubBatch>(__size__, width_);
+
+      size_t __words__ = 0;
+      for(int j = 0; j < width_; ++j) {
+        for(int i = 0; i < __size__; ++i) {
+          sb->indices()[j * __size__ + i] = indices_[j * size_ + pos + i];
+          sb->mask()[j * __size__ + i] = mask_[j * size_ + pos + i];
+          if(mask_[j * size_ + pos + i] != 0)
+            __words__++;
+        }
+      }
+
+      sb->setWords(__words__);
+      splits.push_back(sb);
+
+      totSize -= __size__;
+      pos += __size__;
+    }
+    return splits;
+  }
+
   void setWords(size_t words) { words_ = words; }
 };
 
 class CorpusBatch : public Batch {
 private:
   std::vector<Ptr<SubBatch>> batches_;
-  std::vector<size_t> sentenceIds_;
   std::vector<float> guidedAlignment_;
 
 public:
@@ -89,15 +119,18 @@ public:
   Ptr<SubBatch> back() { return batches_.back(); }
 
   void debug() {
-    size_t i = 0;
+    std::cerr << "batches: " << sets() << std::endl;
+
     if(!sentenceIds_.empty()) {
-      for(auto i : sentenceIds_)
-        std::cerr << i << " ";
+      std::cerr << "indexes: ";
+      for(auto id : sentenceIds_)
+        std::cerr << id << " ";
       std::cerr << std::endl;
     }
 
+    size_t b = 0;
     for(auto sb : batches_) {
-      std::cerr << "input " << i++ << ": " << std::endl;
+      std::cerr << "batch " << b++ << ": " << std::endl;
       for(size_t i = 0; i < sb->batchWidth(); i++) {
         std::cerr << "\t w: ";
         for(size_t j = 0; j < sb->batchSize(); j++) {
@@ -107,6 +140,32 @@ public:
         std::cerr << std::endl;
       }
     }
+  }
+
+  std::vector<Ptr<Batch>> split(size_t n) {
+    std::vector<Ptr<Batch>> splits;
+
+    std::vector<std::vector<Ptr<SubBatch>>> subs(n);
+
+    for(auto subBatch : batches_) {
+      size_t i = 0;
+      for(auto splitSubBatch : subBatch->split(n))
+        subs[i++].push_back(splitSubBatch);
+    }
+
+    for(auto subBatches : subs)
+      splits.push_back(New<CorpusBatch>(subBatches));
+
+    size_t pos = 0;
+    for(auto split : splits) {
+      std::vector<size_t> ids;
+      for(int i = pos; i < pos + split->size(); ++i)
+        ids.push_back(sentenceIds_[i]);
+      split->setSentenceIds(ids);
+      pos += split->size();
+    }
+
+    return splits;
   }
 
   size_t size() const { return batches_[0]->batchSize(); }
@@ -122,6 +181,8 @@ public:
 
     for(auto len : lengths) {
       auto sb = New<SubBatch>(batchSize, len);
+      std::fill(sb->mask().begin(), sb->mask().end(), 1);
+
       batches.push_back(sb);
     }
 
@@ -181,18 +242,17 @@ public:
     std::string line;
     size_t c = 0;
 
-    LOG(data)->info("Loading word alignment from {}", fname);
+    LOG(info, "[data] Loading word alignment from {}", fname);
 
     while(std::getline((std::istream&)aStream, line)) {
       data_.emplace_back();
       std::vector<std::string> atok = split(line, " -");
-      ;
       for(size_t i = 0; i < atok.size(); i += 2)
         data_.back().emplace_back(std::stoi(atok[i]), std::stoi(atok[i + 1]));
       c++;
     }
 
-    LOG(data)->info("Done");
+    LOG(info, "[data] Done");
   }
 
   std::vector<std::string> split(const std::string& input,
@@ -231,6 +291,7 @@ private:
   std::vector<UPtr<InputFileStream>> files_;
   std::vector<Ptr<Vocab>> vocabs_;
   size_t maxLength_;
+  bool maxLengthCrop_;
 
   std::mt19937 g_;
   std::vector<size_t> ids_;
@@ -323,6 +384,5 @@ private:
     wordAlignment_ = New<WordAlignment>(path);
   }
 };
-
 }
 }

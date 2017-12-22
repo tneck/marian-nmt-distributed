@@ -1,12 +1,7 @@
 #pragma once
 
 #include "marian.h"
-
-#include "models/s2s.h"
-#include "models/amun.h"
-#include "models/hardatt.h"
-#include "models/multi_s2s.h"
-#include "models/lm.h"
+#include "models/model_factory.h"
 
 namespace marian {
 
@@ -38,7 +33,8 @@ public:
   virtual Ptr<ScorerState> step(Ptr<ExpressionGraph>,
                                 Ptr<ScorerState>,
                                 const std::vector<size_t>&,
-                                const std::vector<size_t>&)
+                                const std::vector<size_t>&,
+                                int dimBatch, int beamSize)
       = 0;
 
   virtual void init(Ptr<ExpressionGraph> graph) {}
@@ -60,36 +56,18 @@ public:
   }
 };
 
-template <class EncoderDecoder>
 class ScorerWrapper : public Scorer {
 private:
   Ptr<EncoderDecoder> encdec_;
   std::string fname_;
 
 public:
-  template <class... Args>
-  ScorerWrapper(const std::string& name,
+  ScorerWrapper(Ptr<models::ModelBase> encdec,
+                const std::string& name,
                 float weight,
-                const std::string& fname,
-                Ptr<Config> options,
-                Args... args)
+                const std::string& fname)
       : Scorer(name, weight),
-        encdec_(New<EncoderDecoder>(options,
-                                    std::vector<size_t>({0, 1}),
-                                    keywords::inference = true,
-                                    args...)),
-        fname_(fname) {}
-
-  template <class... Args>
-  ScorerWrapper(const std::string& name,
-                float weight,
-                const std::string& fname,
-                Ptr<Config> options,
-                const std::vector<size_t>& batchIndices,
-                Args... args)
-      : Scorer(name, weight),
-        encdec_(New<EncoderDecoder>(
-            options, batchIndices, keywords::inference = true, args...)),
+        encdec_(std::dynamic_pointer_cast<EncoderDecoder>(encdec)),
         fname_(fname) {}
 
   virtual void init(Ptr<ExpressionGraph> graph) {
@@ -111,12 +89,13 @@ public:
   virtual Ptr<ScorerState> step(Ptr<ExpressionGraph> graph,
                                 Ptr<ScorerState> state,
                                 const std::vector<size_t>& hypIndices,
-                                const std::vector<size_t>& embIndices) {
+                                const std::vector<size_t>& embIndices,
+                                int dimBatch, int beamSize) {
     graph->switchParams(getName());
     auto wrappedState
         = std::dynamic_pointer_cast<ScorerWrapperState>(state)->getState();
     return New<ScorerWrapperState>(
-        encdec_->step(graph, wrappedState, hypIndices, embIndices));
+        encdec_->step(graph, wrappedState, hypIndices, embIndices, dimBatch, beamSize));
   }
 };
 
@@ -161,7 +140,8 @@ public:
   virtual Ptr<ScorerState> step(Ptr<ExpressionGraph> graph,
                                 Ptr<ScorerState> state,
                                 const std::vector<size_t>& hypIndices,
-                                const std::vector<size_t>& embIndices) {
+                                const std::vector<size_t>& embIndices,
+                                int dimBatch, int beamSize) {
     return state;
   }
 };
@@ -196,7 +176,8 @@ public:
   virtual Ptr<ScorerState> step(Ptr<ExpressionGraph> graph,
                                 Ptr<ScorerState> state,
                                 const std::vector<size_t>& hypIndices,
-                                const std::vector<size_t>& embIndices) {
+                                const std::vector<size_t>& embIndices,
+                                int dimBatch, int beamSize) {
     return state;
   }
 };
@@ -204,57 +185,7 @@ public:
 Ptr<Scorer> scorerByType(std::string fname,
                          float weight,
                          std::string model,
-                         Ptr<Config> options) {
-  std::string type = options->get<std::string>("type");
+                         Ptr<Config> config);
 
-  LOG(info)->info("Loading scorer of type {} as feature {}", type, fname);
-
-  if(type == "s2s") {
-    return New<ScorerWrapper<S2S>>(fname, weight, model, options);
-  } else if(type == "amun") {
-    return New<ScorerWrapper<Amun>>(fname, weight, model, options);
-  } else if(type == "lm") {
-    const std::vector<size_t> idx = {1};
-    return New<ScorerWrapper<LM>>(fname, weight, model, options, idx);
-  } else if(type == "hard-att") {
-    return New<ScorerWrapper<HardAtt>>(fname, weight, model, options);
-  } else if(type == "hard-soft-att") {
-    return New<ScorerWrapper<HardSoftAtt>>(fname, weight, model, options);
-  } else if(type == "multi-s2s") {
-    return New<ScorerWrapper<MultiS2S>>(fname, weight, model, options);
-  } else if(type == "multi-hard-att") {
-    return New<ScorerWrapper<MultiHardSoftAtt>>(fname, weight, model, options);
-  } else {
-    UTIL_THROW2("Unknown decoder type: " + type);
-  }
-}
-
-std::vector<Ptr<Scorer>> createScorers(Ptr<Config> options) {
-  std::vector<Ptr<Scorer>> scorers;
-
-  auto models = options->get<std::vector<std::string>>("models");
-  int dimVocab = options->get<std::vector<int>>("dim-vocabs").back();
-
-  std::vector<float> weights(models.size(), 1.f);
-  if(options->has("weights"))
-    weights = options->get<std::vector<float>>("weights");
-
-  int i = 0;
-  for(auto model : models) {
-    std::string fname = "F" + std::to_string(i);
-    auto modelOptions = New<Config>(*options);
-
-    try {
-      modelOptions->loadModelParameters(model);
-    } catch(std::runtime_error& e) {
-      LOG(warn)->warn("No model settings found in model file");
-    }
-
-    scorers.push_back(scorerByType(fname, weights[i], model, modelOptions));
-    i++;
-  }
-
-  return scorers;
-}
-
+std::vector<Ptr<Scorer>> createScorers(Ptr<Config> options);
 }

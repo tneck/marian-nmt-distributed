@@ -12,12 +12,6 @@
 #include <boost/thread/shared_mutex.hpp>
 
 #include "3rd_party/threadpool.h"
-#include "common/definitions.h"
-#include "data/batch_generator.h"
-#include "optimizers/optimizers.h"
-#include "training/scheduler.h"
-#include "training/training.h"
-#include "training/validator.h"
 #include "training/graph_group.h"
 
 namespace marian {
@@ -25,13 +19,9 @@ namespace marian {
 /**
  * @brief Multi-node graph group for asynchronous training over multiple machines each with one or multiple GPUs
  */
-template <class Builder>
 class MultiNodeGraphGroup : public GraphGroup {
 public:
-  typedef Builder builder_type;
-  typedef typename Builder::dataset_type dataset_type;
-
-  virtual void setScheduler(Ptr<Scheduler<dataset_type>> scheduler);
+  virtual void setScheduler(Ptr<Scheduler> scheduler);
 
 protected:
 
@@ -39,11 +29,11 @@ protected:
 
   bool firstBatchProcessed_{false};
 
-  std::vector<Ptr<Builder>> builders_;
+  std::vector<Ptr<models::ModelBase>> builders_;
   std::vector<Ptr<ExpressionGraph>> graphs_;
   std::vector<size_t> devices_;
 
-  Ptr<Scheduler<dataset_type>> scheduler_;
+  Ptr<Scheduler> scheduler_;
 
   std::mutex mutexClientInit_;
 
@@ -52,7 +42,7 @@ protected:
   std::vector<Tensor> paramsAvg_;
   std::vector<Ptr<TensorAllocator>> paramsAllocAvg_;
   bool movingAvg_{false};
-  float mvDecay_{0.9999};
+  float mvDecay_{1e-4};
 
   ThreadPool * pool_;
 
@@ -68,7 +58,6 @@ protected:
   int mpi_comm_world_size_{1};
 
   static const int MPI_TAG_GRAD_PUSH_{0};
-  static const int MPI_TAG_BATCH_WORDS_PUSH_{4};
   static const int MPI_TAG_PARAM_PUSH_{5};
 
   // Server (shard) thread variables
@@ -93,7 +82,7 @@ protected:
   std::vector<size_t> nodeShardSizes_;
   std::vector<size_t> gpuShardSizes_;
 
-  std::vector<size_t> multiNodeDevices_;
+  std::vector<int> multiNodeDevices_;
 
   static const unsigned int MSG_INFO_SIZE_{0}, MSG_INFO_CLIENT_{1}, MSG_INFO_BATCHWORDS_{2}, MSG_INFO_STATUS_{3};
   static const unsigned int STATUS_NODE_TRAINING_{0}, STATUS_NODE_FINISHED_{1};
@@ -208,16 +197,15 @@ public:
   /**
    * @brief (Constructor) Configure settings and initialize graphs, shard optimizers, local optimizers, graph builders, etc. and their associated variables
    */
-  template <class... Args>
-  MultiNodeGraphGroup(Ptr<Config> options, Args... args)
+  MultiNodeGraphGroup(Ptr<Config> options)
       : GraphGroup(options),
-        multiNodeDevices_{options_->get<std::vector<size_t>>("multi-node-devices")},
+        multiNodeDevices_{options_->get<std::vector<int>>("multi-node-devices")},
         commOverlap_{options_->get<bool>("multi-node-overlap")},
         maxNumberComputeIters_{options_->get<int>("multi-node-max-compute")},
         commOverlapSingleActive_{options_->get<bool>("multi-node-single-comm")},
-        movingAvg_{options_->get<bool>("moving-average")},
-        mvDecay_{(float)options_->get<double>("moving-decay")},
-        tau_{options_->get<size_t>("tau")} {
+        movingAvg_{options_->get<float>("exponential-smoothing") > 0},
+        mvDecay_{options_->get<float>("exponential-smoothing")},
+        tau_{options_->get<size_t>("optimizer-delay")} {
     initMPI();
     setupClientsOfNodesAndDevices();
     gpuSummedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
@@ -235,7 +223,7 @@ public:
       graphs_.push_back(graph);
       gpuShardsOpts_.push_back(Optimizer(options_));
       localOpts_.push_back(Optimizer(options_)); // => for simple SGD opt: localOpts_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
-      builders_.push_back(New<Builder>(options_, args...));
+      builders_.push_back(models::from_config(options_));
     }
   }
 

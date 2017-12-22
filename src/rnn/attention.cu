@@ -12,22 +12,12 @@ struct AttentionNodeOp : public NaryNodeOp {
       : NaryNodeOp(nodes, keywords::shape = newShape(nodes)) {}
 
   Shape newShape(const std::vector<Expr>& nodes) {
-    Shape shape = nodes[1]->shape();
+    Shape shape = Shape::broadcast({nodes[1], nodes[2]});
 
     Shape vaShape = nodes[0]->shape();
-    Shape ctxShape = nodes[1]->shape();
-    Shape stateShape = nodes[2]->shape();
+    ABORT_IF(vaShape[-2] != shape[-1] || vaShape[-1] != 1, "Wrong size");
 
-    for(int i = 0; i < stateShape.size(); ++i) {
-      UTIL_THROW_IF2(ctxShape[i] != stateShape[i] && ctxShape[i] != 1
-                         && stateShape[i] != 1,
-                     "Shapes cannot be broadcasted");
-      shape.set(i, std::max(ctxShape[i], stateShape[i]));
-    }
-
-    UTIL_THROW_IF2(vaShape[0] != shape[1] || vaShape[1] != 1, "Wrong size");
-
-    shape.set(1, 1);
+    shape.set(-1, 1);
     return shape;
   }
 
@@ -35,8 +25,7 @@ struct AttentionNodeOp : public NaryNodeOp {
     return {NodeOp(Att(val_,
                        child(0)->val(),
                        child(1)->val(),
-                       child(2)->val(),
-                       children_.size() == 4 ? child(3)->val() : nullptr))};
+                       child(2)->val()))};
   }
 
   NodeOps backwardOps() {
@@ -44,11 +33,9 @@ struct AttentionNodeOp : public NaryNodeOp {
       NodeOp(AttBack(child(0)->grad(),
                      child(1)->grad(),
                      child(2)->grad(),
-                     children_.size() == 4 ? child(3)->grad() : nullptr,
                      child(0)->val(),
                      child(1)->val(),
                      child(2)->val(),
-                     children_.size() == 4 ? child(3)->val() : nullptr,
                      adj_);)
     };
   }
@@ -64,17 +51,17 @@ struct AttentionNodeOp : public NaryNodeOp {
   const std::string color() { return "yellow"; }
 };
 
-Expr attOps(Expr va, Expr context, Expr state, Expr coverage) {
+Expr attOps(Expr va, Expr context, Expr state) {
   std::vector<Expr> nodes{va, context, state};
-  if(coverage)
-    nodes.push_back(coverage);
 
-  int dimBatch = context->shape()[0];
-  int dimWords = context->shape()[2];
-  int dimBeam = state->shape()[3];
+  int dimBatch = context->shape()[-2];
+  int dimWords = context->shape()[-3];
+  int dimBeam = 1;
+  if(state->shape().size() > 3)
+    dimBeam = state->shape()[-4];
+
   return reshape(Expression<AttentionNodeOp>(nodes),
-                 {dimWords, dimBatch, 1, dimBeam});
+                 {dimBeam, 1, dimWords, dimBatch});
 }
-
 }
 }

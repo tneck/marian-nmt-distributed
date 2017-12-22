@@ -11,14 +11,19 @@
 #include "graph/expression_operators.h"
 #include "layers/generic.h"
 
-#include "rnn/types.h"
 #include "rnn/attention.h"
 #include "rnn/cells.h"
+#include "rnn/types.h"
 
 namespace marian {
-  namespace rnn {
-    enum struct dir : int { forward, backward, alternating_forward, alternating_backward };
-  }
+namespace rnn {
+enum struct dir : int {
+  forward,
+  backward,
+  alternating_forward,
+  alternating_backward
+};
+}
 }
 
 YAML_REGISTER_TYPE(marian::rnn::dir, int)
@@ -63,7 +68,7 @@ private:
 
     auto xWs = cell_->applyInput({input});
 
-    size_t timeSteps = input->shape()[2];
+    size_t timeSteps = input->shape()[-3];
 
     States outputs;
     for(size_t i = 0; i < timeSteps; ++i) {
@@ -73,11 +78,13 @@ private:
         j = timeSteps - i - 1;
 
       std::vector<Expr> steps(xWs.size());
-      std::transform(xWs.begin(), xWs.end(), steps.begin(),
-                     [j](Expr e) { return step(e, j); });
+      std::transform(xWs.begin(),
+                     xWs.end(),
+                     steps.begin(),
+                     [j](Expr e) { return step(e, j, -3); });
 
       if(mask)
-        state = cell_->applyState(steps, state, step(mask, j));
+        state = cell_->applyState(steps, state, step(mask, j, -3));
       else
         state = cell_->applyState(steps, state);
 
@@ -94,20 +101,20 @@ private:
 
   States apply(const Expr input, const Expr mask = nullptr) {
     auto graph = input->graph();
-    int dimBatch = input->shape()[0];
+
+    int dimBatch = input->shape()[-2];
     int dimState = cell_->getOptions()->get<int>("dimState");
 
-    auto output = graph->zeros(keywords::shape = {dimBatch, dimState});
+    auto output = graph->zeros(keywords::shape = {1, dimBatch, dimState});
     Expr cell = output;
-    State startState{ output, cell };
+    State startState{output, cell};
 
     return apply(input, States({startState}), mask);
   }
 
   SingleLayerRNN(Ptr<ExpressionGraph> graph, Ptr<Options> options)
       : BaseRNN(graph, options),
-        direction_(options->get<dir>("direction", dir::forward))
-      {}
+        direction_(options->get<dir>("direction", dir::forward)) {}
 
 public:
   friend RNN;
@@ -125,23 +132,17 @@ public:
     return apply(input, States({state}), mask).outputs();
   }
 
-  States lastCellStates() {
-    return last_;
-  }
+  States lastCellStates() { return last_; }
 
-  void push_back(Ptr<Cell> cell) {
-    cell_ = cell;
-  }
+  void push_back(Ptr<Cell> cell) { cell_ = cell; }
 
   virtual Ptr<Cell> at(int i) {
-    UTIL_THROW_IF2(i > 0, "SingleRNN only has one cell");
+    ABORT_IF(i > 0, "SingleRNN only has one cell");
     return cell_;
   }
 };
 
-
-class RNN : public BaseRNN,
-            public std::enable_shared_from_this<RNN> {
+class RNN : public BaseRNN, public std::enable_shared_from_this<RNN> {
 private:
   bool skip_;
   bool skipFirst_;
@@ -154,13 +155,14 @@ public:
         skipFirst_(options->get("skipFirst", false)) {}
 
   void push_back(Ptr<Cell> cell) {
-    auto rnn = Ptr<SingleLayerRNN>(new SingleLayerRNN(graph_, cell->getOptions()));
+    auto rnn
+        = Ptr<SingleLayerRNN>(new SingleLayerRNN(graph_, cell->getOptions()));
     rnn->push_back(cell);
     rnns_.push_back(rnn);
   }
 
   Expr transduce(Expr input, Expr mask = nullptr) {
-    UTIL_THROW_IF2(rnns_.empty(), "0 layers in RNN");
+    ABORT_IF(rnns_.empty(), "0 layers in RNN");
 
     Expr output;
     Expr layerInput = input;
@@ -171,7 +173,7 @@ public:
       auto lazyInputs = cell->getLazyInputs(shared_from_this());
       if(!lazyInputs.empty()) {
         lazyInputs.push_back(layerInput);
-        lazyInput = concatenate(lazyInputs, keywords::axis=1);
+        lazyInput = concatenate(lazyInputs, keywords::axis = -1);
       }
 
       auto layerOutput = rnns_[i]->transduce(lazyInput, mask);
@@ -187,7 +189,7 @@ public:
   }
 
   Expr transduce(Expr input, States states, Expr mask = nullptr) {
-    UTIL_THROW_IF2(rnns_.empty(), "0 layers in RNN");
+    ABORT_IF(rnns_.empty(), "0 layers in RNN");
 
     Expr output;
     Expr layerInput = input;
@@ -197,13 +199,13 @@ public:
       auto lazyInputs = cell->getLazyInputs(shared_from_this());
       if(!lazyInputs.empty()) {
         lazyInputs.push_back(layerInput);
-        lazyInput = concatenate(lazyInputs, keywords::axis=1);
-      }
-      else {
+        lazyInput = concatenate(lazyInputs, keywords::axis = -1);
+      } else {
         lazyInput = layerInput;
       }
 
-      auto layerOutput = rnns_[i]->transduce(lazyInput, States({states[i]}), mask);
+      auto layerOutput
+          = rnns_[i]->transduce(lazyInput, States({states[i]}), mask);
 
       if(skip_ && (skipFirst_ || i > 0))
         output = layerOutput + layerInput;
@@ -216,7 +218,7 @@ public:
   }
 
   Expr transduce(Expr input, State state, Expr mask = nullptr) {
-    UTIL_THROW_IF2(rnns_.empty(), "0 layers in RNN");
+    ABORT_IF(rnns_.empty(), "0 layers in RNN");
 
     Expr output;
     Expr layerInput = input;
@@ -227,7 +229,7 @@ public:
       auto lazyInputs = cell->getLazyInputs(shared_from_this());
       if(!lazyInputs.empty()) {
         lazyInputs.push_back(layerInput);
-        lazyInput = concatenate(lazyInputs, keywords::axis=1);
+        lazyInput = concatenate(lazyInputs, keywords::axis = -1);
       }
 
       auto layerOutput = rnns_[i]->transduce(lazyInput, States({state}), mask);
@@ -249,11 +251,7 @@ public:
     return temp;
   }
 
-  virtual Ptr<Cell> at(int i) {
-    return rnns_[i]->at(0);
-  }
-
+  virtual Ptr<Cell> at(int i) { return rnns_[i]->at(0); }
 };
-
 }
 }

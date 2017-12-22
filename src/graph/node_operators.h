@@ -11,8 +11,7 @@ struct ConstantNode : public Node {
       : Node(args...),
         init_(Get(keywords::init, [](Tensor) {})),
         initialized_(false) {
-    UTIL_THROW_IF2(!Has(keywords::shape),
-                   "Constant items require shape information");
+    ABORT_IF(!Has(keywords::shape), "Constant items require shape information");
     setTrainable(false);
   }
 
@@ -34,9 +33,7 @@ struct ConstantNode : public Node {
     return seed;
   }
 
-  virtual bool equal(Expr node) {
-    return this == node.get();
-  }
+  virtual bool equal(Expr node) { return this == node.get(); }
 
 private:
   std::function<void(Tensor)> init_;
@@ -49,9 +46,10 @@ struct ParamNode : public Node {
       : Node(args...),
         init_(Get(keywords::init, [](Tensor) {})),
         initialized_(false) {
-    UTIL_THROW_IF2(!Has(keywords::shape),
-                   "Param items require shape information");
-    setTrainable(!Get(keywords::fixed, false));
+    ABORT_IF(!Has(keywords::shape), "Param items require shape information");
+
+    bool fixed = Get(keywords::fixed, false);
+    setTrainable(!fixed);
   }
 
   ~ParamNode() {}
@@ -73,9 +71,7 @@ struct ParamNode : public Node {
     return seed;
   }
 
-  virtual bool equal(Expr node) {
-    return name() == node->name();
-  }
+  virtual bool equal(Expr node) { return name() == node->name(); }
 
 private:
   std::function<void(Tensor&)> init_;

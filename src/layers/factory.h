@@ -1,7 +1,7 @@
 #pragma once
 
-#include "rnn/rnn.h"
 #include "common/options.h"
+#include "graph/expression_graph.h"
 
 namespace marian {
 
@@ -12,17 +12,13 @@ protected:
 
 public:
   Factory(Ptr<ExpressionGraph> graph)
-  : options_(New<Options>()), graph_(graph) {}
+      : options_(New<Options>()), graph_(graph) {}
 
   virtual ~Factory() {}
 
-  Ptr<Options> getOptions() {
-    return options_;
-  }
+  Ptr<Options> getOptions() { return options_; }
 
-  std::string str() {
-    return options_->str();
-  }
+  std::string str() { return options_->str(); }
 
   template <typename T>
   T opt(const std::string& key) {
@@ -38,6 +34,7 @@ public:
 template <class Factory>
 class Accumulator : public Factory {
 public:
+  Accumulator() : Factory(nullptr) {}
   Accumulator(Ptr<ExpressionGraph> graph) : Factory(graph) {}
   Accumulator(const Factory& factory) : Factory(factory) {}
   Accumulator(const Accumulator&) = default;
@@ -59,9 +56,18 @@ public:
     return *this;
   }
 
+  Accumulator& operator()(Ptr<Options> options) {
+    Factory::getOptions()->merge(options);
+    return *this;
+  }
+
+  Accumulator& operator()(Ptr<Config> config) {
+    Factory::getOptions()->merge(config->get());
+    return *this;
+  }
+
   Accumulator<Factory> clone() {
     return Accumulator<Factory>(Factory::clone());
   }
 };
-
 }

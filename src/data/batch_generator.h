@@ -1,8 +1,8 @@
 #pragma once
 
 #include <deque>
-#include <queue>
 #include <functional>
+#include <queue>
 
 #include <boost/timer/timer.hpp>
 
@@ -27,13 +27,11 @@ private:
   Ptr<Config> options_;
   Ptr<BatchStats> stats_;
 
-  bool forceBatchSize_{false};
   int batchSize_{1};
 
   typename DataSet::iterator current_;
 
   size_t maxiBatchSize_;
-
   std::deque<BatchPtr> bufferedBatches_;
   BatchPtr currentBatch_;
 
@@ -48,9 +46,7 @@ private:
       return a.back().size() < b.back().size();
     };
 
-    auto cmpNone = [](const sample& a, const sample& b) {
-      return &a < &b;
-    };
+    auto cmpNone = [](const sample& a, const sample& b) { return &a < &b; };
 
     typedef std::function<bool(const sample&, const sample&)> cmp_type;
     typedef std::priority_queue<sample, samples, cmp_type> sample_queue;
@@ -64,15 +60,11 @@ private:
         maxiBatch.reset(new sample_queue(cmpNone));
       else
         maxiBatch.reset(new sample_queue(cmpTrg));
-    }
-    else {
+    } else {
       maxiBatch.reset(new sample_queue(cmpNone));
     }
 
     int maxBatchSize = options_->get<int>("mini-batch");
-    if(forceBatchSize_)
-      maxBatchSize = batchSize_;
-
     int maxSize = maxBatchSize * options_->get<int>("maxi-batch");
 
     size_t sets = 0;
@@ -95,15 +87,15 @@ private:
       bool makeBatch = batchVector.size() == maxBatchSize;
 
       // Batch size based on words
-      if(!forceBatchSize_ && options_->has("mini-batch-words")) {
+      if(options_->has("mini-batch-words")) {
         int mbWords = options_->get<int>("mini-batch-words");
         if(mbWords > 0)
           makeBatch = currentWords > mbWords;
       }
 
-      if(!forceBatchSize_ && options_->has("dynamic-batching")) {
+      if(options_->has("mini-batch-fit")) {
         // Dynamic batching
-        if(stats_ && options_->get<bool>("dynamic-batching")) {
+        if(stats_ && options_->get<bool>("mini-batch-fit")) {
           for(size_t i = 0; i < sets; ++i)
             if(batchVector.back()[i].size() > lengths[i])
               lengths[i] = batchVector.back()[i].size();
@@ -146,8 +138,7 @@ public:
   operator bool() const { return !bufferedBatches_.empty(); }
 
   BatchPtr next() {
-    UTIL_THROW_IF2(bufferedBatches_.empty(),
-                   "No batches to fetch, run prepare()");
+    ABORT_IF(bufferedBatches_.empty(), "No batches to fetch, run prepare()");
     currentBatch_ = bufferedBatches_.front();
     bufferedBatches_.pop_front();
 
@@ -155,11 +146,6 @@ public:
       fillBatches();
 
     return currentBatch_;
-  }
-
-  void forceBatchSize(int batchSize) {
-    forceBatchSize_ = true;
-    batchSize_ = batchSize;
   }
 
   void prepare(bool shuffle = true) {

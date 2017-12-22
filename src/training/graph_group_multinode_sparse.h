@@ -1,8 +1,6 @@
 #pragma once
 
-#if MPI_FOUND
-#include "mpi.h"
-#endif
+#include "training/graph_group_multinode.h"
 
 #include <future>
 #include <thread>
@@ -12,23 +10,18 @@
 #include <boost/thread/shared_mutex.hpp>
 
 #include "3rd_party/threadpool.h"
-#include "common/definitions.h"
-#include "data/batch_generator.h"
-#include "optimizers/optimizers.h"
 #include "training/dropper.h"
-#include "training/scheduler.h"
 #include "training/sparse_tensor.h"
-#include "training/training.h"
-#include "training/validator.h"
-#include "training/graph_group_multinode.h"
+#if MPI_FOUND
+#include "mpi.h"
+#endif
 
 namespace marian {
 
 /**
  * @brief Multi-node graph group for asynchronous training over multiple machines each with one or multiple GPUs
  */
-template <class Builder>
-class MultiNodeSparseGraphGroup : public MultiNodeGraphGroup<Builder> {
+class MultiNodeSparseGraphGroup : public MultiNodeGraphGroup {
 private:
 
   // MPI variables
@@ -103,7 +96,7 @@ public:
    */
   template <class... Args>
   MultiNodeSparseGraphGroup(Ptr<Config> options, Args... args)
-      : MultiNodeGraphGroup<Builder>(options),
+      : MultiNodeGraphGroup(options),
         dropRate_{options->get<double>("multi-node-drop-rate")} {}
 
 };

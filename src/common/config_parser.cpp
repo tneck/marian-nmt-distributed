@@ -4,8 +4,8 @@
 #include <string>
 
 #include "3rd_party/cnpy/cnpy.h"
-#include "common/config_parser.h"
 #include "common/config.h"
+#include "common/config_parser.h"
 #include "common/file_stream.h"
 #include "common/logging.h"
 #include "common/version.h"
@@ -84,6 +84,7 @@ const std::set<std::string> PATHS = {"model",
                                      "valid-sets",
                                      "valid-script-path",
                                      "valid-log",
+                                     "valid-translation-output",
                                      "log"};
 
 void ProcessPaths(YAML::Node& node,
@@ -133,8 +134,11 @@ bool ConfigParser::has(const std::string& key) const {
 }
 
 void ConfigParser::validateOptions() const {
-  if(mode_ == ConfigMode::translating)
+  //UTIL_THROW_IF2(!has("vocabs"), "No vocabularies provided");
+
+  if(mode_ == ConfigMode::translating) {
     return;
+  }
 
   UTIL_THROW_IF2(
       !has("train-sets") || get<std::vector<std::string>>("train-sets").empty(),
@@ -156,9 +160,16 @@ void ConfigParser::validateOptions() const {
 
   boost::filesystem::path modelPath(get<std::string>("model"));
   auto modelDir = modelPath.parent_path();
+  if(modelDir.empty())
+    modelDir = boost::filesystem::current_path();
+
   UTIL_THROW_IF2(
       !modelDir.empty() && !boost::filesystem::is_directory(modelDir),
       "Model directory does not exist");
+
+  UTIL_THROW_IF2(!modelDir.empty() && !(boost::filesystem::status(modelDir).permissions()
+                 & boost::filesystem::owner_write),
+                 "No write permission in model directory");
 
   UTIL_THROW_IF2(
       has("valid-sets")
@@ -199,6 +210,10 @@ void ConfigParser::addOptionsCommon(po::options_description& desc) {
     ("log-level", po::value<std::string>()->default_value("info"),
      "Set verbosity level of logging "
      "(trace - debug - info - warn - err(or) - critical - off)")
+    ("quiet", po::value<bool>()->zero_tokens()->default_value(false),
+     "Suppress all logging to stderr. Logging to files still works")
+    ("quiet-translation", po::value<bool>()->zero_tokens()->default_value(false),
+     "Suppress logging for translation")
     ("seed", po::value<size_t>()->default_value(0),
      "Seed for all random number generators. 0 means initialize randomly")
     ("relative-paths", po::value<bool>()->zero_tokens()->default_value(false),
@@ -219,9 +234,7 @@ void ConfigParser::addOptionsModel(po::options_description& desc) {
   // clang-format off
   if(mode_ == ConfigMode::translating) {
     model.add_options()
-    ("models,m", po::value<std::vector<std::string>>()
-      ->multitoken()
-      ->default_value(std::vector<std::string>({"model.npz"}), "model.npz"),
+    ("models,m", po::value<std::vector<std::string>>()->multitoken(),
      "Paths to model(s) to be loaded");
   } else {
     model.add_options()
@@ -230,12 +243,14 @@ void ConfigParser::addOptionsModel(po::options_description& desc) {
   }
 
   model.add_options()
+    ("ignore-model-config", po::value<bool>()->zero_tokens()->default_value(false),
+     "Ignore the model configuration saved in npz file")
     ("type", po::value<std::string>()->default_value("amun"),
-      "Model type (possible values: amun, s2s, multi-s2s)")
+      "Model type (possible values: amun, nematus, s2s, multi-s2s, transformer)")
     ("dim-vocabs", po::value<std::vector<int>>()
       ->multitoken()
-      ->default_value(std::vector<int>({50000, 50000}), "50000 50000"),
-     "Maximum items in vocabulary ordered by rank")
+      ->default_value(std::vector<int>({0, 0}), "0 0"),
+     "Maximum items in vocabulary ordered by rank, 0 uses all items in the provided/created vocabulary file")
     ("dim-emb", po::value<int>()->default_value(512),
      "Size of embedding vector")
     ("dim-rnn", po::value<int>()->default_value(1024),
@@ -263,7 +278,7 @@ void ConfigParser::addOptionsModel(po::options_description& desc) {
     ("layer-normalization", po::value<bool>()->zero_tokens()->default_value(false),
      "Enable layer normalization")
     ("best-deep", po::value<bool>()->zero_tokens()->default_value(false),
-     "Use WMT-2017-style deep configuration (s2s)")
+     "Use Edinburgh deep RNN configuration (s2s)")
     ("special-vocab", po::value<std::vector<size_t>>()->multitoken(),
      "Model-specific special vocabulary ids")
     ("tied-embeddings", po::value<bool>()->zero_tokens()->default_value(false),
@@ -272,6 +287,31 @@ void ConfigParser::addOptionsModel(po::options_description& desc) {
      "Tie source and target embeddings")
     ("tied-embeddings-all", po::value<bool>()->zero_tokens()->default_value(false),
      "Tie all embedding layers and output layer")
+    ("transformer-heads", po::value<int>()->default_value(8),
+     "Number of head in multi-head attention (transformer)")
+    ("transformer-dim-ffn", po::value<int>()->default_value(2048),
+     "Size of position-wise feed-forward network (transformer)")
+    ("transformer-preprocess", po::value<std::string>()->default_value(""),
+     "Operation before each transformer layer: d = dropout, a = add, n = normalize")
+    ("transformer-postprocess-emb", po::value<std::string>()->default_value("d"),
+     "Operation after transformer embedding layer: d = dropout, a = add, n = normalize")
+    ("transformer-postprocess", po::value<std::string>()->default_value("dan"),
+     "Operation after each transformer layer: d = dropout, a = add, n = normalize")
+#ifdef CUDNN
+    ("char-stride", po::value<int>()->default_value(5),
+     "Width of max-pooling layer after convolution layer in char-s2s model")
+    ("char-highway", po::value<int>()->default_value(4),
+     "Number of highway network layers after max-pooling in char-s2s model")
+    ("char-conv-filters-num", po::value<std::vector<int>>()
+      ->default_value(std::vector<int>({200, 200, 250, 250, 300, 300, 300, 300}),
+                                      "200 200 250 250 300 300 300 300")
+      ->multitoken(),
+     "Numbers of convolution filters of correspoding width in char-s2s model")
+    ("char-conv-filters-widths", po::value<std::vector<int>>()
+     ->default_value(std::vector<int>({1, 2, 3, 4, 5, 6, 7, 8}), "1 2 3 4 5 6 7 8")
+      ->multitoken(),
+     "Convolution window widths in char-s2s model")
+#endif
     ;
 
   if(mode_ == ConfigMode::training) {
@@ -282,9 +322,12 @@ void ConfigParser::addOptionsModel(po::options_description& desc) {
        "Dropout source words (0 = no dropout)")
       ("dropout-trg", po::value<float>()->default_value(0),
        "Dropout target words (0 = no dropout)")
-      ("noise-src", po::value<float>()->default_value(0),
-       "Add noise to source embeddings with given stddev (0 = no noise)")
-
+      ("gradient-dropping", po::value<float>()->default_value(0),
+       "Gradient Dropping rate (0 = no gradient Dropping)")
+      ("transformer-dropout", po::value<float>()->default_value(0),
+       "Dropout between transformer layers (0 = no dropout)")
+      ("transformer-dropout-attention", po::value<float>()->default_value(0),
+       "Dropout for transformer attention (0 = no dropout)")
     ;
   }
   // clang-format on
@@ -296,6 +339,8 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
   po::options_description training("Training options", guess_terminal_width());
   // clang-format off
   training.add_options()
+    ("cost-type", po::value<std::string>()->default_value("ce-mean"),
+      "Optimization criterion: ce-mean, ce-mean-words, ce-sum, perplexity")
     ("overwrite", po::value<bool>()->zero_tokens()->default_value(false),
       "Overwrite model with following checkpoints")
     ("no-reload", po::value<bool>()->zero_tokens()->default_value(false),
@@ -309,6 +354,8 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
       "If these files do not exists they are created")
     ("max-length", po::value<size_t>()->default_value(50),
       "Maximum length of a sentence in a training sentence pair")
+    ("max-length-crop", po::value<bool>()->zero_tokens()->default_value(false),
+      "Crop a sentence to max-length instead of ommitting it if longer than max-length")
     ("after-epochs,e", po::value<size_t>()->default_value(0),
       "Finish after this many epochs, 0 is infinity")
     ("after-batches", po::value<size_t>()->default_value(0),
@@ -330,8 +377,8 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
       "Size of mini-batch used during update")
     ("mini-batch-words", po::value<int>()->default_value(0),
       "Set mini-batch size based on words instead of sentences")
-    ("dynamic-batching", po::value<bool>()->zero_tokens()->default_value(false),
-      "Determine mini-batch size dynamically based on sentence-length and reserved memory")
+    ("mini-batch-fit", po::value<bool>()->zero_tokens()->default_value(false),
+      "Determine mini-batch size automatically based on sentence-length to fit reserved memory")
     ("maxi-batch", po::value<int>()->default_value(100),
       "Number of batches to preload for length-based sorting")
     ("maxi-batch-sort", po::value<std::string>()->default_value("trg"),
@@ -339,6 +386,11 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
 
     ("optimizer,o", po::value<std::string>()->default_value("adam"),
      "Optimization algorithm (possible values: sgd, adagrad, adam")
+    ("optimizer-params",  po::value<std::vector<float>>()
+       ->multitoken(),
+     "Parameters for optimization algorithm, e.g. betas for adam")
+    ("optimizer-delay", po::value<size_t>()->default_value(1),
+     "SGD update delay, 1 = no delay")
     ("learn-rate,l", po::value<double>()->default_value(0.0001),
      "Learning rate")
     ("lr-decay", po::value<double>()->default_value(0.0),
@@ -354,24 +406,42 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
     ("lr-decay-freq", po::value<size_t>()->default_value(50000),
      "Learning rate decaying frequency for batches, "
      "requires --lr-decay-strategy to be batches")
+    ("lr-decay-reset-optimizer", po::value<bool>()->zero_tokens()->default_value(false),
+      "Reset running statistics of optimizer whenever learning rate decays")
+
+    ("lr-decay-repeat-warmup", po::value<bool>()
+     ->zero_tokens()->default_value(false),
+     "Repeat learning rate warmup when learning rate is decayed")
+    ("lr-decay-inv-sqrt", po::value<size_t>()->default_value(0),
+     "Decrease learning rate at arg / sqrt(no. updates) starting at arg")
+
+    ("lr-warmup", po::value<size_t>()->default_value(0),
+     "Increase learning rate linearly for arg first steps")
+    ("lr-warmup-start-rate", po::value<float>()->default_value(0),
+     "Start value for learning rate warmup")
+    ("lr-warmup-cycle", po::value<bool>()->zero_tokens()->default_value(false),
+     "Apply cyclic warmup")
+    ("lr-warmup-at-reload", po::value<bool>()->zero_tokens()->default_value(false),
+     "Repeat warmup after interrupted training")
+
+    ("lr-report", po::value<bool>()
+     ->zero_tokens()->default_value(false),
+     "Report learning rate for each update")
+
     ("batch-flexible-lr", po::value<bool>()->zero_tokens()->default_value(false),
       "Scales the learning rate based on the number of words in a mini-batch")
     ("batch-normal-words", po::value<double>()->default_value(1920.0),
-      "This can option is only active when batch-flexible-lr is on. It determines number of words per batch that the learning rate corresponds to.")
-    ("tau", po::value<size_t>()->default_value(1),
-     "SGD update delay, 1 = no delay")
-
+      "Set number of words per batch that the learning rate corresponds to. "
+      "The option is only active when batch-flexible-lr is on")
+    ("sync-sgd", po::value<bool>()->zero_tokens()->default_value(false),
+     "Use synchronous SGD instead of asynchronous for multi-gpu training")
+    ("label-smoothing", po::value<double>()->default_value(0),
+     "Epsilon for label smoothing (0 to disable)")
     ("clip-norm", po::value<double>()->default_value(1.f),
      "Clip gradient norm to  arg  (0 to disable)")
-    ("moving-average", po::value<bool>()->zero_tokens()->default_value(false),
-     "Maintain and save moving average of parameters")
-    ("moving-decay", po::value<double>()->default_value(0.9999, "0.9999"),
-     "Decay factor for moving average")
-    //("moving-inject-freq", po::value<size_t>()->default_value(0),
-    // "Replace model parameters with moving average every  arg  updates (0 to disable)")
-    //("lexical-table", po::value<std::string>(),
-    // "Load lexical table")
-
+    ("exponential-smoothing", po::value<float>()->default_value(0.f)->implicit_value(1e-4, "1e-4"),
+     "Maintain smoothed version of parameters for validation and saving with smoothing factor arg. "
+     " 0 to disable.")
     ("guided-alignment", po::value<std::string>(),
      "Use guided alignment to guide attention")
     ("guided-alignment-cost", po::value<std::string>()->default_value("ce"),
@@ -380,8 +450,8 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
     ("guided-alignment-weight", po::value<double>()->default_value(1),
      "Weight for guided alignment cost")
 
-    ("drop-rate", po::value<double>()->default_value(0),
-     "Gradient drop ratio (read: https://arxiv.org/abs/1704.05021)")
+    //("drop-rate", po::value<double>()->default_value(0),
+    // "Gradient drop ratio (read: https://arxiv.org/abs/1704.05021)")
     ("embedding-vectors", po::value<std::vector<std::string>>()
       ->multitoken(),
      "Paths to files with custom source and target embedding vectors")
@@ -436,12 +506,18 @@ void ConfigParser::addOptionsValid(po::options_description& desc) {
       ->multitoken()
       ->default_value(std::vector<std::string>({"cross-entropy"}),
                       "cross-entropy"),
-      "Metric to use during validation: cross-entropy, perplexity, valid-script. "
+      "Metric to use during validation: cross-entropy, perplexity, "
+      "valid-script, translation. "
       "Multiple metrics can be specified")
-    ("valid-mini-batch", po::value<int>()->default_value(64),
+    ("valid-mini-batch", po::value<int>()->default_value(32),
       "Size of mini-batch used during validation")
+    ("valid-max-length", po::value<size_t>()->default_value(1000),
+      "Maximum length of a sentence in a validating sentence pair")
     ("valid-script-path", po::value<std::string>(),
-     "Path to external validation script")
+     "Path to external validation script. "
+     "It should print a single score to stdout. "
+     "If the option is used with validating translation, the output "
+     "translation file will be passed as a first argument ")
     ("early-stopping", po::value<size_t>()->default_value(10),
      "Stop if the first validation metric does not improve for  arg  consecutive "
      "validation steps")
@@ -450,12 +526,16 @@ void ConfigParser::addOptionsValid(po::options_description& desc) {
     ("valid-log", po::value<std::string>(),
      "Log validation scores to file given by  arg")
 
-    /*("beam-size", po::value<size_t>()->default_value(12),
+    ("valid-translation-output", po::value<std::string>(),
+     "Path to store the translation")
+    ("beam-size,b", po::value<size_t>()->default_value(12),
       "Beam size used during search with validating translator")
-    ("normalize", po::value<bool>()->zero_tokens()->default_value(false),
-      "Normalize translation score by translation length")
+    ("normalize,n", po::value<float>()->default_value(0.f)->implicit_value(1.f),
+      "Divide translation score by pow(translation length, arg) ")
     ("allow-unk", po::value<bool>()->zero_tokens()->default_value(false),
-      "Allow unknown words to appear in output")*/
+      "Allow unknown words to appear in output")
+    ("n-best", po::value<bool>()->zero_tokens()->default_value(false),
+      "Generate n-best list")
   ;
   // clang-format on
   desc.add(valid);
@@ -474,12 +554,14 @@ void ConfigParser::addOptionsTranslate(po::options_description& desc) {
       "Paths to vocabulary files have to correspond to --input")
     ("beam-size,b", po::value<size_t>()->default_value(12),
       "Beam size used during search")
-    ("normalize,n", po::value<bool>()->zero_tokens()->default_value(false),
-      "Normalize translation score by translation length")
+    ("normalize,n", po::value<float>()->default_value(0.f)->implicit_value(1.f),
+      "Divide translation score by pow(translation length, arg) ")
     ("allow-unk", po::value<bool>()->zero_tokens()->default_value(false),
       "Allow unknown words to appear in output")
     ("max-length", po::value<size_t>()->default_value(1000),
       "Maximum length of a sentence in a training sentence pair")
+    ("max-length-crop", po::value<bool>()->zero_tokens()->default_value(false),
+      "Crop a sentence to max-length instead of ommitting it if longer than max-length")
     ("devices,d", po::value<std::vector<int>>()
       ->multitoken()
       ->default_value(std::vector<int>({0}), "0"),
@@ -488,6 +570,8 @@ void ConfigParser::addOptionsTranslate(po::options_description& desc) {
       "Size of mini-batch used during update")
     ("maxi-batch", po::value<int>()->default_value(1),
       "Number of batches to preload for length-based sorting")
+    ("maxi-batch-sort", po::value<std::string>()->default_value("none"),
+      "Sorting strategy for maxi-batch: none (default) src")
     ("n-best", po::value<bool>()->zero_tokens()->default_value(false),
       "Display n-best list")
     //("lexical-table", po::value<std::string>(),
@@ -516,8 +600,12 @@ void ConfigParser::addOptionsRescore(po::options_description& desc) {
       "If this parameter is not supplied we look for vocabulary files "
       "source.{yml,json} and target.{yml,json}. "
       "If these files do not exists they are created")
+    ("summary", po::value<std::string>()->implicit_value("cross-entropy"),
+      "Only print total cost, possible values: cross-entropy (ce-mean), ce-mean-words, ce-sum, perplexity")
     ("max-length", po::value<size_t>()->default_value(1000),
       "Maximum length of a sentence in a training sentence pair")
+    ("max-length-crop", po::value<bool>()->zero_tokens()->default_value(false),
+      "Crop a sentence to max-length instead of ommitting it if longer than max-length")
     ("devices,d", po::value<std::vector<int>>()
       ->multitoken()
       ->default_value(std::vector<int>({0}), "0"),
@@ -527,8 +615,8 @@ void ConfigParser::addOptionsRescore(po::options_description& desc) {
       "Size of mini-batch used during update")
     ("mini-batch-words", po::value<int>()->default_value(0),
       "Set mini-batch size based on words instead of sentences")
-    ("dynamic-batching", po::value<bool>()->zero_tokens()->default_value(false),
-      "Determine mini-batch size dynamically based on sentence-length and reserved memory")
+    ("mini-batch-fit", po::value<bool>()->zero_tokens()->default_value(false),
+      "Determine mini-batch size automatically based on sentence-length to fit reserved memory")
     ("maxi-batch", po::value<int>()->default_value(100),
       "Number of batches to preload for length-based sorting")
     ;
@@ -536,9 +624,7 @@ void ConfigParser::addOptionsRescore(po::options_description& desc) {
   desc.add(rescore);
 }
 
-void ConfigParser::parseOptions(
-    int argc, char** argv, bool doValidate) {
-
+void ConfigParser::parseOptions(int argc, char** argv, bool doValidate) {
   addOptionsCommon(cmdline_options_);
   addOptionsModel(cmdline_options_);
 
@@ -558,7 +644,6 @@ void ConfigParser::parseOptions(
   }
   // clang-format on
 
-
   boost::program_options::variables_map vm_;
   try {
     po::store(
@@ -576,6 +661,19 @@ void ConfigParser::parseOptions(
     std::cerr << "Usage: " + std::string(argv[0]) + " [options]" << std::endl;
     std::cerr << cmdline_options_ << std::endl;
     exit(0);
+  }
+
+  if(mode_ == ConfigMode::translating) {
+    if(vm_.count("models") == 0 && vm_.count("config") == 0) {
+      std::cerr << "Error: you need to provide at least one model file or a "
+                   "config file"
+                << std::endl
+                << std::endl;
+
+      std::cerr << "Usage: " + std::string(argv[0]) + " [options]" << std::endl;
+      std::cerr << cmdline_options_ << std::endl;
+      exit(0);
+    }
   }
 
   if(vm_["version"].as<bool>()) {
@@ -598,7 +696,7 @@ void ConfigParser::parseOptions(
   /** model **/
 
   if(mode_ == ConfigMode::translating) {
-    SET_OPTION("models", std::vector<std::string>);
+    SET_OPTION_NONDEFAULT("models", std::vector<std::string>);
   } else {
     SET_OPTION("model", std::string);
   }
@@ -607,6 +705,7 @@ void ConfigParser::parseOptions(
     config_["vocabs"] = vm_["vocabs"].as<std::vector<std::string>>();
   }
 
+  SET_OPTION("ignore-model-config", bool);
   SET_OPTION("type", std::string);
   SET_OPTION("dim-vocabs", std::vector<int>);
   SET_OPTION("dim-emb", int);
@@ -621,22 +720,40 @@ void ConfigParser::parseOptions(
   SET_OPTION("dec-cell-base-depth", int);
   SET_OPTION("dec-cell-high-depth", int);
   SET_OPTION("dec-depth", int);
-  // SET_OPTION("dec-high-context", std::string);
 
   SET_OPTION("skip", bool);
   SET_OPTION("tied-embeddings", bool);
   SET_OPTION("tied-embeddings-src", bool);
   SET_OPTION("tied-embeddings-all", bool);
   SET_OPTION("layer-normalization", bool);
+  SET_OPTION("transformer-heads", int);
+  SET_OPTION("transformer-preprocess", std::string);
+  SET_OPTION("transformer-postprocess", std::string);
+  SET_OPTION("transformer-postprocess-emb", std::string);
+  SET_OPTION("transformer-dim-ffn", int);
+  SET_OPTION("transformer-dim-ffn", int);
+
+#ifdef CUDNN
+  SET_OPTION("char-stride", int);
+  SET_OPTION("char-highway", int);
+  SET_OPTION("char-conv-filters-num", std::vector<int>);
+  SET_OPTION("char-conv-filters-widths", std::vector<int>);
+#endif
 
   SET_OPTION("best-deep", bool);
   SET_OPTION_NONDEFAULT("special-vocab", std::vector<size_t>);
 
   if(mode_ == ConfigMode::training) {
+    SET_OPTION("cost-type", std::string);
+
     SET_OPTION("dropout-rnn", float);
     SET_OPTION("dropout-src", float);
     SET_OPTION("dropout-trg", float);
-    SET_OPTION("noise-src", float);
+
+    SET_OPTION("gradient-dropping", float);
+
+    SET_OPTION("transformer-dropout", float);
+    SET_OPTION("transformer-dropout-attention", float);
 
     SET_OPTION("overwrite", bool);
     SET_OPTION("no-reload", bool);
@@ -651,29 +768,39 @@ void ConfigParser::parseOptions(
     SET_OPTION("tempdir", std::string);
 
     SET_OPTION("optimizer", std::string);
+    SET_OPTION_NONDEFAULT("optimizer-params", std::vector<float>);
+    SET_OPTION("optimizer-delay", size_t);
     SET_OPTION("learn-rate", double);
-    SET_OPTION("tau", size_t);
+    SET_OPTION("sync-sgd", bool);
     SET_OPTION("mini-batch-words", int);
-    SET_OPTION("dynamic-batching", bool);
+    SET_OPTION("mini-batch-fit", bool);
 
     SET_OPTION("lr-decay", double);
     SET_OPTION("lr-decay-strategy", std::string);
     SET_OPTION("lr-decay-start", std::vector<size_t>);
     SET_OPTION("lr-decay-freq", size_t);
+    SET_OPTION("lr-decay-reset-optimizer", bool);
+    SET_OPTION("lr-warmup", size_t);
+
+    SET_OPTION("lr-decay-inv-sqrt", size_t);
+    SET_OPTION("lr-warmup-start-rate", float);
+    SET_OPTION("lr-warmup-cycle", bool);
+
+    SET_OPTION("lr-decay-repeat-warmup", bool);
+    SET_OPTION("lr-warmup-at-reload", bool);
+    SET_OPTION("lr-report", bool);
+
     SET_OPTION("batch-flexible-lr", bool);
     SET_OPTION("batch-normal-words", double);
 
+    SET_OPTION("label-smoothing", double);
     SET_OPTION("clip-norm", double);
-    SET_OPTION("moving-average", bool);
-    SET_OPTION("moving-decay", double);
-    //SET_OPTION("moving-inject-freq", size_t);
-
-    // SET_OPTION_NONDEFAULT("lexical-table", std::string);
+    SET_OPTION("exponential-smoothing", float);
 
     SET_OPTION_NONDEFAULT("guided-alignment", std::string);
     SET_OPTION("guided-alignment-cost", std::string);
     SET_OPTION("guided-alignment-weight", double);
-    SET_OPTION("drop-rate", double);
+    // SET_OPTION("drop-rate", double);
     SET_OPTION_NONDEFAULT("embedding-vectors", std::vector<std::string>);
     SET_OPTION("embedding-normalization", bool);
     SET_OPTION("embedding-fix-src", bool);
@@ -693,16 +820,16 @@ void ConfigParser::parseOptions(
       config_["train-sets"] = vm_["train-sets"].as<std::vector<std::string>>();
     }
     SET_OPTION("mini-batch-words", int);
-    SET_OPTION("dynamic-batching", bool);
+    SET_OPTION("mini-batch-fit", bool);
+    SET_OPTION_NONDEFAULT("summary", std::string);
   }
   if(mode_ == ConfigMode::translating) {
     SET_OPTION("input", std::vector<std::string>);
-    SET_OPTION("normalize", bool);
-    SET_OPTION("n-best", bool);
     SET_OPTION("beam-size", size_t);
+    SET_OPTION("normalize", float);
     SET_OPTION("allow-unk", bool);
+    SET_OPTION("n-best", bool);
     SET_OPTION_NONDEFAULT("weights", std::vector<float>);
-    // SET_OPTION_NONDEFAULT("lexical-table", std::string);
     SET_OPTION("port", size_t);
   }
 
@@ -715,14 +842,17 @@ void ConfigParser::parseOptions(
     SET_OPTION("valid-freq", size_t);
     SET_OPTION("valid-metrics", std::vector<std::string>);
     SET_OPTION("valid-mini-batch", int);
+    SET_OPTION("valid-max-length", size_t);
     SET_OPTION_NONDEFAULT("valid-script-path", std::string);
     SET_OPTION("early-stopping", size_t);
     SET_OPTION("keep-best", bool);
     SET_OPTION_NONDEFAULT("valid-log", std::string);
 
-    // SET_OPTION("normalize", bool);
-    // SET_OPTION("beam-size", size_t);
-    // SET_OPTION("allow-unk", bool);
+    SET_OPTION_NONDEFAULT("valid-translation-output", std::string);
+    SET_OPTION("beam-size", size_t);
+    SET_OPTION("normalize", float);
+    SET_OPTION("allow-unk", bool);
+    SET_OPTION("n-best", bool);
   }
 
   if(doValidate) {
@@ -739,6 +869,8 @@ void ConfigParser::parseOptions(
 
   SET_OPTION("workspace", size_t);
   SET_OPTION("log-level", std::string);
+  SET_OPTION("quiet", bool);
+  SET_OPTION("quiet-translation", bool);
   SET_OPTION_NONDEFAULT("log", std::string);
   SET_OPTION("seed", size_t);
   SET_OPTION("relative-paths", bool);
@@ -746,9 +878,10 @@ void ConfigParser::parseOptions(
   SET_OPTION("mini-batch", int);
   SET_OPTION("maxi-batch", int);
 
-  if(mode_ == ConfigMode::training)
+  if(mode_ == ConfigMode::training || mode_ == ConfigMode::translating)
     SET_OPTION("maxi-batch-sort", std::string);
   SET_OPTION("max-length", size_t);
+  SET_OPTION("max-length-crop", bool);
 
   if(vm_["best-deep"].as<bool>()) {
     config_["layer-normalization"] = true;

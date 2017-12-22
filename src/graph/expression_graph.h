@@ -59,6 +59,8 @@ public:
    */
   ExpressionGraph(bool inference = false);
 
+  void setInference(bool inference) { inferenceOnly_ = inference; }
+
   ~ExpressionGraph() {
     clear();
     params_->clear();
@@ -176,8 +178,8 @@ public:
    *    and that all backward pass computations have been performed.
    */
   void backward() {
-    UTIL_THROW_IF2(topNodes_.size() > 1,
-                   "There are more than one top most node for backward step");
+    ABORT_IF(topNodes_.size() > 1,
+             "There are more than one top most node for backward step");
 
     params_->allocateBackward();
     params_->set_zero_adjoint();
@@ -197,6 +199,7 @@ public:
         if(child->trainable())
           child->set_zero_adjoint();
       }
+
       if(v->trainable())
         v->backward();
 
@@ -266,24 +269,24 @@ public:
     auto p = params_->get(name);
     if(p) {
       // if yes add to tape and return
+      ABORT_IF(shape != p->shape(),
+               "Requested shape for existing parameter '{}' does not match "
+               "original shape",
+               name);
 
-      UTIL_THROW_IF2(shape != p->shape(),
-                     "Requested shape for existing parameter "
-                     << name
-                     << " does not match original shape");
-
+      bool fixed = Get(keywords::fixed, false, args...);
+      p->setTrainable(!fixed);
       add(p);
       return p;
     }
 
     // if graph was reloaded do not allow creation of new parameters
-    UTIL_THROW_IF2(reloaded_,
-                   "Graph was reloaded and parameter " << name << " is newly created");
+    ABORT_IF(reloaded_,
+             "Graph was reloaded and parameter '{}' is newly created",
+             name);
 
     // if not check if name is not taken by other node
-    UTIL_THROW_IF2(get(name),
-                   "Non-parameter with name " << name << "already exists");
-
+    ABORT_IF(get(name), "Non-parameter with name '{}' already exists", name);
 
     // create parameter node (adds to tape)
     p = Expression<ParamNode>(
@@ -382,30 +385,14 @@ public:
   Expr add(Expr node) {
     // size_t group = 0;
 
-
     size_t hash = node->hash();
     auto it = hashMap_.find(hash);
     if(it != hashMap_.end()) {
-
       for(auto foundWeak : it->second) {
         auto found = foundWeak.lock();
         if(node->equal(found))
           return found;
       }
-
-      //auto f = it->second.lock();
-      //if(f->type() == "layer_normalization") {
-      //std::cerr << "n: " << node->type() << " " << node->name() << " " << node->hash() << std::endl;
-      //for(auto c : node->children())
-      //  std::cerr << c->getId() << " " << c->type() << " " << c->name() << " " << c->hash() << std::endl;
-      //
-      //std::cerr << "f: " << f->type() << " " << f->name() << " " << f->hash() << std::endl;
-      //for(auto c : f->children())
-      //  std::cerr << c->getId() << " " << c->type() << " " << c->name() << " " << c->hash() << std::endl;
-      //
-      //std::cerr << "equal: " << node->equal(f) << std::endl;
-      //}
-      //return it->second.lock();
     }
 
     hashMap_[hash].push_back(node);
@@ -433,6 +420,8 @@ public:
       tensors_->free(t);
   }
 
+  Ptr<Allocator<DeviceGPU>> allocator() { return tensors_->allocator(); }
+
   void clear() {
     // clear everything apart from parameters
     count_ = 0;
@@ -446,18 +435,14 @@ public:
 
   void clearParameters() { params_->clear(); }
 
-  void setReloaded(bool reloaded) {
-    reloaded_ = reloaded;
-  }
+  void setReloaded(bool reloaded) { reloaded_ = reloaded; }
 
-  void setThrowNaN(bool throwNaN) {
-    throwNaN_ = throwNaN;
-  }
+  void setThrowNaN(bool throwNaN) { throwNaN_ = throwNaN; }
 
-  void load(const std::string& name) {
+  void load(const std::string& name, bool markReloaded) {
     using namespace keywords;
 
-    LOG(info)->info("Loading model from {}", name);
+    LOG(info, "Loading model from {}", name);
     setReloaded(false);
 
     auto numpy = cnpy::npz_load(name);
@@ -470,10 +455,11 @@ public:
 
       Shape shape;
       if(it.second.shape.size() == 1) {
+        shape.resize(2);
         shape.set(0, 1);
         shape.set(1, it.second.shape[0]);
-      }
-      else {
+      } else {
+        shape.resize(it.second.shape.size());
         for(int i = 0; i < it.second.shape.size(); ++i)
           shape.set(i, it.second.shape[i]);
       }
@@ -481,11 +467,12 @@ public:
       param(name, shape, init = inits::from_numpy(it.second));
     }
 
-    setReloaded(true);
+    if(markReloaded)
+      setReloaded(true);
   }
 
   void save(const std::string& name) {
-    LOG(info)->info("Saving model to {}", name);
+    LOG(info, "Saving model to {}", name);
 
     std::string mode = "w";
 
@@ -500,34 +487,16 @@ public:
 
       std::vector<float> v;
       p.second->val() >> v;
+      auto& pShape = p.second->shape();
 
-      unsigned shape[4];
-      unsigned dim;
+      unsigned dim = pShape.size();
+      unsigned* shape = new unsigned[dim];
+      for(int i = 0; i < dim; ++i)
+        shape[i] = pShape[i];
 
-      auto ps = p.second->shape();
-      if(ps[0] == 1 && ps[2] == 1 && ps[3] == 1) {
-        shape[0] = ps[1];
-        dim = 1;
-        cnpy::npz_save(name, pName, v.data(), shape, dim, mode);
-      } else if(ps[2] == 1 && ps[3] == 1) {
-        shape[0] = ps[0];
-        shape[1] = ps[1];
-        dim = 2;
-        cnpy::npz_save(name, pName, v.data(), shape, dim, mode);
-      } else if(ps[3] == 1) {
-        shape[0] = ps[0];
-        shape[1] = ps[1];
-        shape[2] = ps[2];
-        dim = 3;
-        cnpy::npz_save(name, pName, v.data(), shape, dim, mode);
-      } else {
-        shape[0] = ps[0];
-        shape[1] = ps[1];
-        shape[2] = ps[2];
-        shape[3] = ps[3];
-        dim = 4;
-        cnpy::npz_save(name, pName, v.data(), shape, dim, mode);
-      }
+      cnpy::npz_save(name, pName, v.data(), shape, dim, mode);
+
+      delete[] shape;
       mode = "a";
     }
   }

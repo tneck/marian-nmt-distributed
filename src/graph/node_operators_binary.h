@@ -5,21 +5,8 @@
 #include "graph/backend_gpu.h"
 #include "graph/node.h"
 #include "kernels/tensor_operators.h"
-#include "kernels/thrust_functions.h"
-
-#ifdef CUDNN
-
-#include <cudnn.h>
-
-#define CUDA_CALL(x) do { if((x) != cudaSuccess) { \
-      printf("Error at %s:%d\n",__FILE__,__LINE__);     \
-      return EXIT_FAILURE;}} while(0)
-
-#define CUDNN_CALL(x) do { if((x) != CUDNN_STATUS_SUCCESS) { \
-      printf("Error (%s) at %s:%d\n",cudnnGetErrorString(x),__FILE__,__LINE__);     \
-      }} while(0)
-
-#endif
+#include "functional/functional.h"
+#include "kernels/cudnn_wrappers.h"
 
 namespace marian {
 
@@ -31,29 +18,36 @@ private:
 
 public:
   template <typename... Args>
-  DotNodeOp(Expr a, Expr b,
-            bool transA, bool transB, float scalar,
+  DotNodeOp(Expr a,
+            Expr b,
+            bool transA,
+            bool transB,
+            float scalar,
             Args... args)
-      : NaryNodeOp({a, b}, keywords::shape = newShape(a, b, transA, transB), args...),
-        transA_(transA), transB_(transB), scalar_(scalar) {}
+      : NaryNodeOp({a, b},
+                   keywords::shape = newShape(a, b, transA, transB),
+                   args...),
+        transA_(transA),
+        transB_(transB),
+        scalar_(scalar) {}
 
   Shape newShape(Expr a, Expr b, bool transA, bool transB) {
     auto shapeA = a->shape();
     if(transA) {
-      shapeA.set(0, a->shape()[1]);
-      shapeA.set(1, a->shape()[0]);
+      shapeA.set(shapeA.size() - 2, a->shape()[shapeA.size() - 1]);
+      shapeA.set(shapeA.size() - 1, a->shape()[shapeA.size() - 2]);
     }
 
     auto shapeB = b->shape();
     if(transB) {
-      shapeB.set(0, b->shape()[1]);
-      shapeB.set(1, b->shape()[0]);
+      shapeB.set(shapeB.size() - 2, b->shape()[shapeB.size() - 1]);
+      shapeB.set(shapeB.size() - 1, b->shape()[shapeB.size() - 2]);
     }
 
     Shape outShape = shapeA;
-    outShape.set(1, shapeB[1]);
-    UTIL_THROW_IF2(shapeA[1] != shapeB[0],
-                   "matrix product requires dimensions to match");
+    outShape.set(outShape.size() - 1, shapeB[shapeB.size() - 1]);
+    ABORT_IF(shapeA[shapeA.size() - 1] != shapeB[shapeB.size() - 2],
+             "matrix product requires dimensions to match");
     return outShape;
   }
 
@@ -76,13 +70,74 @@ public:
     // df/dB += alpha * dot(op(A).T, D)
     // beta set to 1.0 in gemm, C = alpha * dot(op(A), op(B)) + beta * C
     // to sum gradients from different graph parts
+
+    if(!transA_ && transB_)
+      return {NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                              ->getCublasHandle(),
+                          child(0)->grad(),
+                          adj_,
+                          child(1)->val(),
+                          false,
+                          false,
+                          1.0,
+                          scalar_)),
+              NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                              ->getCublasHandle(),
+                          child(1)->grad(),
+                          adj_,
+                          child(0)->val(),
+                          true,
+                          false,
+                          1.0,
+                          scalar_))};
+
+    if(transA_ && !transB_)
+      return {NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                              ->getCublasHandle(),
+                          child(0)->grad(),
+                          child(1)->val(),
+                          adj_,
+                          false,
+                          true,
+                          1.0,
+                          scalar_)),
+              NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                              ->getCublasHandle(),
+                          child(1)->grad(),
+                          child(0)->val(),
+                          adj_,
+                          false,
+                          false,
+                          1.0,
+                          scalar_))};
+
+    if(transA_ && transB_)
+      return {NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                              ->getCublasHandle(),
+                          child(0)->grad(),
+                          child(1)->val(),
+                          adj_,
+                          true,
+                          true,
+                          1.0,
+                          scalar_)),
+              NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                              ->getCublasHandle(),
+                          child(1)->grad(),
+                          adj_,
+                          child(0)->val(),
+                          true,
+                          true,
+                          1.0,
+                          scalar_))};
+
     return {NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
                             ->getCublasHandle(),
                         child(0)->grad(),
                         adj_,
                         child(1)->val(),
                         false,
-                        !transB_,
+                        true,
                         1.0,
                         scalar_)),
             NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
@@ -90,7 +145,7 @@ public:
                         child(1)->grad(),
                         child(0)->val(),
                         adj_,
-                        !transA_,
+                        true,
                         false,
                         1.0,
                         scalar_))};
@@ -101,6 +156,68 @@ public:
   const std::string color() { return "orange"; }
 };
 
+struct AffineNodeOp : public NaryNodeOp {
+  AffineNodeOp(const std::vector<Expr>& nodes)
+      : NaryNodeOp(nodes, keywords::shape = newShape(nodes)) {}
+
+  Shape newShape(const std::vector<Expr>& nodes) {
+    Shape shape1 = nodes[0]->shape();
+    Shape shape2 = nodes[1]->shape();
+    ABORT_IF(shape1[shape1.size() - 1] != shape2[shape2.size() - 2],
+              "matrix product requires dimensions to match");
+    shape1.set(shape1.size() - 1, shape2[shape2.size() - 1]);
+    return shape1;
+  }
+
+  NodeOps forwardOps() {
+    using namespace functional;
+
+    return {
+      NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                      ->getCublasHandle(),
+                  val_,
+                  child(0)->val(),
+                  child(1)->val(),
+                  false,
+                  false);
+             Add(_1, val_, child(2)->val());
+             )
+    };
+  }
+
+  NodeOps backwardOps() {
+    using namespace functional;
+
+    // D is the adjoint, the matrix of derivatives
+    // df/dA += D*B.T
+    // df/dB += A.T*D
+    // beta set to 1.0 in gemm, C = dot(A,B) + beta * C
+    // to sum gradients from different graph parts
+
+    return {NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                            ->getCublasHandle(),
+                        child(0)->grad(),
+                        adj_,
+                        child(1)->val(),
+                        false,
+                        true,
+                        1.0)),
+            NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
+                            ->getCublasHandle(),
+                        child(1)->grad(),
+                        child(0)->val(),
+                        adj_,
+                        true,
+                        false,
+                        1.0)),
+            NodeOp(Add(_1, child(2)->grad(), adj_))
+            };
+  }
+
+  const std::string type() { return "affine"; }
+};
+
+
 class DotBatchedNodeOp : public NaryNodeOp {
 private:
   bool transA_;
@@ -109,29 +226,36 @@ private:
 
 public:
   template <typename... Args>
-  DotBatchedNodeOp(Expr a, Expr b,
-            bool transA, bool transB, float scalar,
-            Args... args)
-      : NaryNodeOp({a, b}, keywords::shape = newShape(a, b, transA, transB), args...),
-        transA_(transA), transB_(transB), scalar_(scalar) {}
+  DotBatchedNodeOp(Expr a,
+                   Expr b,
+                   bool transA,
+                   bool transB,
+                   float scalar,
+                   Args... args)
+      : NaryNodeOp({a, b},
+                   keywords::shape = newShape(a, b, transA, transB),
+                   args...),
+        transA_(transA),
+        transB_(transB),
+        scalar_(scalar) {}
 
   Shape newShape(Expr a, Expr b, bool transA, bool transB) {
     auto shapeA = a->shape();
     if(transA) {
-      shapeA.set(0, a->shape()[1]);
-      shapeA.set(1, a->shape()[0]);
+      shapeA.set(-2, a->shape()[-1]);
+      shapeA.set(-1, a->shape()[-2]);
     }
 
     auto shapeB = b->shape();
     if(transB) {
-      shapeB.set(0, b->shape()[1]);
-      shapeB.set(1, b->shape()[0]);
+      shapeB.set(-2, b->shape()[-1]);
+      shapeB.set(-1, b->shape()[-2]);
     }
 
     Shape outShape = shapeA;
-    outShape.set(1, shapeB[1]);
-    UTIL_THROW_IF2(shapeA[1] != shapeB[0],
-                   "matrix product requires dimensions to match");
+    outShape.set(-1, shapeB[-1]);
+    ABORT_IF(shapeA[-1] != shapeB[-2],
+             "matrix product requires dimensions to match");
     return outShape;
   }
 
@@ -154,24 +278,89 @@ public:
     // df/dB += alpha * dot(op(A).T, D)
     // beta set to 1.0 in gemm, C = alpha * dot(op(A), op(B)) + beta * C
     // to sum gradients from different graph parts
-    return {NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
-                            ->getCublasHandle(),
-                        child(0)->grad(),
-                        adj_,
-                        child(1)->val(),
-                        false,
-                        !transB_,
-                        1.0,
-                        scalar_)),
-            NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
-                            ->getCublasHandle(),
-                        child(1)->grad(),
-                        child(0)->val(),
-                        adj_,
-                        !transA_,
-                        false,
-                        1.0,
-                        scalar_))};
+
+    if(!transA_ && transB_)
+      return {
+          NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
+                                 ->getCublasHandle(),
+                             child(0)->grad(),
+                             adj_,
+                             child(1)->val(),
+                             false,
+                             false,
+                             1.0,
+                             scalar_)),
+          NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
+                                 ->getCublasHandle(),
+                             child(1)->grad(),
+                             adj_,
+                             child(0)->val(),
+                             true,
+                             false,
+                             1.0,
+                             scalar_))};
+
+    if(transA_ && !transB_)
+      return {
+          NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
+                                 ->getCublasHandle(),
+                             child(0)->grad(),
+                             child(1)->val(),
+                             adj_,
+                             false,
+                             true,
+                             1.0,
+                             scalar_)),
+          NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
+                                 ->getCublasHandle(),
+                             child(1)->grad(),
+                             child(0)->val(),
+                             adj_,
+                             false,
+                             false,
+                             1.0,
+                             scalar_))};
+
+    if(transA_ && transB_)
+      return {
+          NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
+                                 ->getCublasHandle(),
+                             child(0)->grad(),
+                             child(1)->val(),
+                             adj_,
+                             true,
+                             true,
+                             1.0,
+                             scalar_)),
+          NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
+                                 ->getCublasHandle(),
+                             child(1)->grad(),
+                             adj_,
+                             child(0)->val(),
+                             true,
+                             true,
+                             1.0,
+                             scalar_))};
+
+    return {
+        NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
+                               ->getCublasHandle(),
+                           child(0)->grad(),
+                           adj_,
+                           child(1)->val(),
+                           false,
+                           true,
+                           1.0,
+                           scalar_)),
+        NodeOp(ProdBatched(std::static_pointer_cast<BackendGPU>(getBackend())
+                               ->getCublasHandle(),
+                           child(1)->grad(),
+                           child(0)->val(),
+                           adj_,
+                           true,
+                           false,
+                           1.0,
+                           scalar_))};
   }
 
   const std::string type() { return "•"; }
@@ -188,26 +377,23 @@ struct ScalarProductNodeOp : public NaryNodeOp {
   template <typename... Args>
   Shape newShape(Expr a, Expr b, Args... args) {
     int ax = keywords::Get(keywords::axis, -1, args...);
-    Shape full = a->shape();
-    for(int i = 0; i < b->shape().size(); ++i)
-      full.set(i, std::max(full[i], b->shape()[i]));
 
-    if(ax != -1) {
-      full.set(ax, 1);
-    } else {
-      full.set(0, 1);
-      full.set(1, 1);
-      full.set(2, 1);
-      full.set(3, 1);
-    }
+    Shape full = Shape::broadcast({a, b});
+    ax = full.axis(ax);
+
+    full.set(ax, 1);
     return full;
   }
 
   NodeOps forwardOps() {
+    using namespace functional;
+
     return {NodeOp(Reduce(_1 * _2, val_, child(0)->val(), child(1)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
+
     return {NodeOp(Add(_1 * _2, child(0)->grad(), child(1)->val(), adj_)),
             NodeOp(Add(_1 * _2, child(1)->grad(), child(0)->val(), adj_))};
   }
@@ -223,14 +409,7 @@ struct ElementBinaryNodeOp : public NaryNodeOp {
       : NaryNodeOp({a, b}, keywords::shape = newShape(a, b), args...) {}
 
   Shape newShape(Expr a, Expr b) {
-    Shape shape1 = a->shape();
-    Shape shape2 = b->shape();
-    for(int i = 0; i < shape1.size(); ++i) {
-      UTIL_THROW_IF2(shape1[i] != shape2[i] && shape1[i] != 1 && shape2[i] != 1,
-                     "Shapes cannot be broadcasted");
-      shape1.set(i, std::max(shape1[i], shape2[i]));
-    }
-    return shape1;
+    return Shape::broadcast({a, b});
   }
 
   const std::string color() { return "yellow"; }
@@ -241,11 +420,15 @@ struct PlusNodeOp : public ElementBinaryNodeOp {
   PlusNodeOp(Args... args) : ElementBinaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
+    using namespace functional;
+
     return {
         NodeOp(Element(_1 = _2 + _3, val_, child(0)->val(), child(1)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
+
     return {NodeOp(Add(_1, child(0)->grad(), adj_)),
             NodeOp(Add(_1, child(1)->grad(), adj_))};
   }
@@ -258,11 +441,15 @@ struct MinusNodeOp : public ElementBinaryNodeOp {
   MinusNodeOp(Args... args) : ElementBinaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
+    using namespace functional;
+
     return {
         NodeOp(Element(_1 = _2 - _3, val_, child(0)->val(), child(1)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
+
     return {NodeOp(Add(_1, child(0)->grad(), adj_)),
             NodeOp(Add(-_1, child(1)->grad(), adj_))};
   }
@@ -275,11 +462,15 @@ struct MultNodeOp : public ElementBinaryNodeOp {
   MultNodeOp(Args... args) : ElementBinaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
+    using namespace functional;
+
     return {
         NodeOp(Element(_1 = _2 * _3, val_, child(0)->val(), child(1)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
+
     return {NodeOp(Add(_1 * _2, child(0)->grad(), adj_, child(1)->val())),
             NodeOp(Add(_1 * _2, child(1)->grad(), adj_, child(0)->val()))};
   }
@@ -292,11 +483,15 @@ struct DivNodeOp : public ElementBinaryNodeOp {
   DivNodeOp(Args... args) : ElementBinaryNodeOp(args...) {}
 
   NodeOps forwardOps() {
+    using namespace functional;
+
     return {
         NodeOp(Element(_1 = _2 / _3, val_, child(0)->val(), child(1)->val()))};
   }
 
   NodeOps backwardOps() {
+    using namespace functional;
+
     return {
         NodeOp(Add(_1 * 1.0f / _2, child(0)->grad(), adj_, child(1)->val())),
         NodeOp(Add(-_1 * _2 / (_3 * _3),
@@ -309,6 +504,29 @@ struct DivNodeOp : public ElementBinaryNodeOp {
   const std::string type() { return "÷"; }
 };
 
+// struct PowNodeOp : public ElementBinaryNodeOp {
+// public:
+//  template <typename... Args>
+//  PowNodeOp(Args... args) : ElementBinaryNodeOp(args...) {}
+//
+//  NodeOps forwardOps() {
+//    return {NodeOp(Element(_1 = Pow(_2, _3), val_,
+//                           child(0)->val(), child(1)->val()))};
+//  }
+//
+//  NodeOps backwardOps() {
+//    return {
+//      NodeOp(Add(_2 * Pow(_1, _2 - 1.f) * _3,
+//                 child(0)->grad(), child(0)->val(), child(1)->val(), adj_)),
+//      NodeOp(Add(Pow(_1, _2) * Log(_1) * _3,
+//                 child(1)->grad(), child(0)->val(), child(1)->val(), adj_))
+//
+//    };
+//  }
+//
+//  const std::string type() { return "pow"; }
+//};
+
 // Cross-entropy node. It computes -b*log(softmax(a)), summing rowwise.
 struct CrossEntropyNodeOp : public NaryNodeOp {
   template <typename... Args>
@@ -317,7 +535,7 @@ struct CrossEntropyNodeOp : public NaryNodeOp {
 
   Shape newShape(Expr a) {
     Shape shape1 = a->shape();
-    shape1.set(1, 1);
+    shape1.set(a->shape().size() - 1, 1);
     return shape1;
   }
 
@@ -340,15 +558,17 @@ struct ConcatenateNodeOp : public NaryNodeOp {
       : NaryNodeOp(nodes,
                    keywords::shape
                    = newShape(nodes, keywords::Get(keywords::axis, 0, args...)),
-                   args...),
-        ax_(keywords::Get(keywords::axis, 0, args...)) {}
+                   args...) {}
 
   Shape newShape(const std::vector<Expr>& nodes, int ax) {
     Shape shape = nodes.back()->shape();
-    shape.set(ax, 0);
+    ax_ = shape.axis(ax);
+
+    int sum = 0;
     for(auto child : nodes)
-      shape.set(ax, shape[ax] + child->shape()[ax]);
-    // std::cerr << ax << " : " << shape[0] << " " << shape[1] << std::endl;
+      sum += child->shape()[ax_];
+    shape.set(ax_, sum);
+
     return shape;
   }
 
@@ -379,7 +599,7 @@ struct ConcatenateNodeOp : public NaryNodeOp {
   virtual bool equal(Expr node) {
     if(!NaryNodeOp::equal(node))
       return false;
-    Ptr<ConcatenateNodeOp> cnode = std::dynamic_pointer_cast<ConcatenateNodeOp>(node);
+    auto cnode = std::dynamic_pointer_cast<ConcatenateNodeOp>(node);
     if(!cnode)
       return false;
     if(ax_ != cnode->ax_)
@@ -403,7 +623,7 @@ struct TanhPlus3NodeOp : public NaryNodeOp {
     for(int n = 1; n < nodes.size(); ++n) {
       Shape shapen = nodes[n]->shape();
       for(int i = 0; i < shapen.size(); ++i) {
-        UTIL_THROW_IF2(shape[i] != shapen[i] && shape[i] != 1 && shapen[i] != 1,
+        ABORT_IF(shape[i] != shapen[i] && shape[i] != 1 && shapen[i] != 1,
                        "Shapes cannot be broadcasted");
         shape.set(i, std::max(shape[i], shapen[i]));
       }
@@ -434,70 +654,18 @@ struct TanhPlus3NodeOp : public NaryNodeOp {
 };
 */
 
-struct AffineNodeOp : public NaryNodeOp {
-  AffineNodeOp(const std::vector<Expr>& nodes)
-      : NaryNodeOp(nodes, keywords::shape = newShape(nodes)) {}
-
-  Shape newShape(const std::vector<Expr>& nodes) {
-    Shape shape1 = nodes[0]->shape();
-    Shape shape2 = nodes[1]->shape();
-    UTIL_THROW_IF2(shape1[1] != shape2[0],
-                   "matrix product requires dimensions to match");
-    shape1.set(1, shape2[1]);
-    return shape1;
-  }
-
-  NodeOps forwardOps() {
-    return {
-      NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
-                      ->getCublasHandle(),
-                  val_,
-                  child(0)->val(),
-                  child(1)->val(),
-                  false,
-                  false);
-             Add(_1, val_, child(2)->val());)
-    };
-  }
-
-  NodeOps backwardOps() {
-    // D is the adjoint, the matrix of derivatives
-    // df/dA += D*B.T
-    // df/dB += A.T*D
-    // beta set to 1.0 in gemm, C = dot(A,B) + beta * C
-    // to sum gradients from different graph parts
-
-    return {NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
-                            ->getCublasHandle(),
-                        child(0)->grad(),
-                        adj_,
-                        child(1)->val(),
-                        false,
-                        true,
-                        1.0)),
-            NodeOp(Prod(std::static_pointer_cast<BackendGPU>(getBackend())
-                            ->getCublasHandle(),
-                        child(1)->grad(),
-                        child(0)->val(),
-                        adj_,
-                        true,
-                        false,
-                        1.0)),
-            NodeOp(Add(_1, child(2)->grad(), adj_))};
-  }
-
-  const std::string type() { return "affine"; }
-};
-
 struct LayerNormalizationOp : public NaryNodeOp {
-  LayerNormalizationOp(const std::vector<Expr>& nodes) : NaryNodeOp(nodes) {}
+public:
+  LayerNormalizationOp(const std::vector<Expr>& nodes, float eps = 1e-9)
+      : NaryNodeOp(nodes), eps_(eps) {}
 
   NodeOps forwardOps() {
-    return {NodeOp(LayerNormalization(
-        val_,
-        child(0)->val(),
-        child(1)->val(),
-        (children_.size() == 3) ? child(2)->val() : nullptr))};
+    return {NodeOp(
+        LayerNormalization(val_,
+                           child(0)->val(),
+                           child(1)->val(),
+                           (children_.size() == 3) ? child(2)->val() : nullptr,
+                           eps_))};
   }
 
   NodeOps backwardOps() {
@@ -509,188 +677,77 @@ struct LayerNormalizationOp : public NaryNodeOp {
         val_,
         child(0)->val(),
         child(1)->val(),
-        (children_.size() == 3) ? child(2)->val() : nullptr))};
+        (children_.size() == 3) ? child(2)->val() : nullptr,
+        eps_))};
   }
 
   const std::string type() { return "layer_normalization"; }
+
+private:
+  float eps_;
 };
 
-#ifdef CUDNN
+struct HighwayNodeOp : public NaryNodeOp {
+  HighwayNodeOp(const std::vector<Expr>& nodes) : NaryNodeOp(nodes) {}
+
+  NodeOps forwardOps() {
+    return {NodeOp(HighwayForward(
+        val_, child(0)->val(), child(1)->val(), child(2)->val()))};
+  }
+
+  NodeOps backwardOps() {
+    return {NodeOp(HighwayBackward(child(0)->grad(),
+                                   child(1)->grad(),
+                                   child(2)->grad(),
+                                   child(0)->val(),
+                                   child(1)->val(),
+                                   child(2)->val(),
+                                   adj_))};
+  }
+
+  const std::string type() { return "highway"; }
+};
+
 class ConvolutionOp : public NaryNodeOp {
-  public:
-    ConvolutionOp( const std::vector<Expr>& nodes)
-        : NaryNodeOp(nodes)
-    {
-      CUDNN_CALL( cudnnCreate(&cudnnHandle_) );
+public:
+  ConvolutionOp(
+      const std::vector<Expr>& nodes,
+      int hPad = 0,
+      int wPad = 0,
+      int hStride = 1,
+      int wStride = 1)
+    : NaryNodeOp(nodes),
+      conv_(nodes[1]->shape(),
+            nodes[2]->shape(),
+            hPad,
+            wPad,
+            hStride,
+            wStride) {
+    conv_.getOutputShape(nodes[0]->shape(), shape_);
+  }
 
-      CUDNN_CALL( cudnnCreateTensorDescriptor(&xDesc_) );
-      CUDNN_CALL( cudnnSetTensor4dDescriptor(xDesc_,
-                    CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                    nodes[0]->shape()[0], nodes[0]->shape()[1],
-                    nodes[0]->shape()[2], nodes[0]->shape()[3]
-      ));
+  NodeOps forwardOps() {
+    return {NodeOp(conv_.forward(
+          child(0)->val(),
+          child(1)->val(),
+          child(2)->val(),
+          val_))};
+  }
 
-      int widthPad = 1;
-      int heightPad = 1;
-      int heightStride = 1;
-      int widthStride = 1;
+  NodeOps backwardOps() {
+    return {NodeOp(conv_.backward(
+          child(0)->val(),
+          child(0)->grad(),
+          child(1)->val(),
+          child(1)->grad(),
+          child(2)->grad(),
+          adj_))};
+  }
 
-      CUDNN_CALL( cudnnCreateConvolutionDescriptor(&convDesc_) );
-#if CUDNN_MAJOR > 5
-      CUDNN_CALL( cudnnSetConvolution2dDescriptor(convDesc_,
-                    heightPad, widthPad, heightStride, widthStride,
-                    1, 1,  // upscales
-                    CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT
-      ));
-#else
-      CUDNN_CALL( cudnnSetConvolution2dDescriptor(convDesc_,
-                    heightPad, widthPad, heightStride, widthStride,
-                    1, 1,  // upscales
-                    CUDNN_CROSS_CORRELATION
-      ));
-#endif
+  const std::string type() { return "layer_convolution"; }
 
-      // std::cerr << "data: " << nodes[0]->shape() << std::endl;
-      // std::cerr << "filter: " << nodes[1]->shape() << std::endl;
-      // std::cerr << "bias: " << nodes[2]->shape() << std::endl;
-
-      int layerIn = nodes[1]->shape()[0];
-      int layerOut  = nodes[1]->shape()[1];
-      kernelH_ = nodes[1]->shape()[2];
-      kernelW_ = nodes[1]->shape()[3];
-      CUDNN_CALL( cudnnCreateFilterDescriptor(&kernelDesc_) );
-      CUDNN_CALL( cudnnSetFilter4dDescriptor( kernelDesc_,
-                    CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
-                    layerOut, layerIn, kernelH_, kernelW_));
-
-      CUDNN_CALL( cudnnCreateTensorDescriptor(&biasDesc_) );
-      CUDNN_CALL( cudnnSetTensor4dDescriptor( biasDesc_,
-                    CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                    nodes[2]->shape()[0], nodes[2]->shape()[1],
-                    nodes[2]->shape()[2], nodes[2]->shape()[3]
-      ));
-
-      CUDNN_CALL( cudnnGetConvolution2dForwardOutputDim(
-        convDesc_,
-        xDesc_,
-        kernelDesc_,
-        shape_.begin(), shape_.begin() + 1, shape_.begin() + 2, shape_.begin() + 3
-      ));
-
-      CUDNN_CALL( cudnnCreateTensorDescriptor(&yDesc_) );
-      CUDNN_CALL( cudnnSetTensor4dDescriptor(yDesc_,
-                                CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                                shape_[0], shape_[1],
-                                shape_[2], shape_[3])
-      );
-      CUDNN_CALL( cudnnCreateTensorDescriptor(&adjDesc_) );
-      CUDNN_CALL( cudnnSetTensor4dDescriptor(adjDesc_,
-                                CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                                shape_[0], shape_[1],
-                                shape_[2], shape_[3])
-      );
-    }
-
-
-    NodeOps forwardOps() {
-      const float alpha = 1.0f;
-      const float beta = 0.0f;
-      cudaSetDevice(val_->getDevice());
-
-      return {
-        NodeOp(CUDNN_CALL(cudnnConvolutionForward(cudnnHandle_,
-                            &alpha,
-                            xDesc_, children_[0]->val()->data(),
-                            kernelDesc_,
-                            children_[1]->val()->data(),
-                            convDesc_,
-                            CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
-                            nullptr, 0,
-                            &beta,
-                            yDesc_, val_->data()))
-        ),
-        NodeOp(CUDNN_CALL(cudnnAddTensor(cudnnHandle_,
-                            &alpha,
-                            biasDesc_, children_[2]->val()->data(),
-                            &alpha,
-                            yDesc_, val_->data()))
-        )
-      };
-    }
-
-    NodeOps backwardOps() {
-      // const float alpha = 1.0f / std::sqrt(float(kernelH_ * kernelW_));
-      const float alpha = 1.0f;
-      const float beta = 1.0f;
-      // std::cerr << "BACKWARD" << std::endl;
-      return {
-        NodeOp(CUDNN_CALL(
-          cudnnConvolutionBackwardData(cudnnHandle_,
-            &alpha,
-            kernelDesc_,
-            children_[1]->val()->data(),
-            adjDesc_,
-            adj_->data(),
-            convDesc_,
-            CUDNN_CONVOLUTION_BWD_DATA_ALGO_0,
-            nullptr, 0,
-            &beta,
-            xDesc_,
-            children_[0]->grad()->data())
-        )),
-        NodeOp(CUDNN_CALL(
-          cudnnConvolutionBackwardFilter(cudnnHandle_,
-            &alpha,
-            xDesc_,
-            children_[0]->val()->data(),
-            adjDesc_,
-            adj_->data(),
-            convDesc_,
-            CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0,
-            nullptr, 0,
-            &beta,
-            kernelDesc_,
-            children_[1]->grad()->data())
-        )),
-        NodeOp(CUDNN_CALL(
-          cudnnConvolutionBackwardBias(cudnnHandle_,
-            &alpha,
-            adjDesc_,
-            adj_->data(),
-            &beta,
-            biasDesc_,
-            children_[2]->grad()->data())
-        ))
-      };
-    }
-
-
-    const std::string type() {
-      return "layer_convolution";
-    }
-
-    virtual ~ConvolutionOp() {
-      cudnnDestroyConvolutionDescriptor(convDesc_);
-      cudnnDestroyFilterDescriptor(kernelDesc_);
-      cudnnDestroy(cudnnHandle_);
-      cudnnDestroyTensorDescriptor(xDesc_);
-      cudnnDestroyTensorDescriptor(yDesc_);
-      cudnnDestroyTensorDescriptor(biasDesc_);
-    }
-
-  protected:
-    cudnnHandle_t cudnnHandle_;
-    cudnnConvolutionDescriptor_t convDesc_;
-    cudnnFilterDescriptor_t kernelDesc_;
-    cudnnTensorDescriptor_t biasDesc_;
-    cudnnTensorDescriptor_t xDesc_;
-    cudnnTensorDescriptor_t yDesc_;
-    cudnnTensorDescriptor_t adjDesc_;
-    int kernelH_;
-    int kernelW_;
-
+protected:
+  ConvolutionWrapper conv_;
 };
-
-#endif
 
 }

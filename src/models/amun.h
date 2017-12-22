@@ -6,42 +6,39 @@
 
 namespace marian {
 
-class Amun : public S2S {
+class Amun : public EncoderDecoder {
 public:
-  template <class... Args>
-  Amun(Ptr<Config> options, Args... args) : S2S(options, args...) {
-
-    UTIL_THROW_IF2(options_->get<int>("enc-depth") > 1,
-                   "--type amun does not currently support multiple encoder "
-                   "layers, use --type s2s");
-    UTIL_THROW_IF2(options_->get<int>("enc-cell-depth") > 1,
-                   "--type amun does not currently support stacked encoder "
-                   "cells, use --type s2s");
-    UTIL_THROW_IF2(options_->get<bool>("skip"),
-                   "--type amun does not currently support skip connections, "
-                   "use --type s2s");
-    UTIL_THROW_IF2(options_->get<int>("dec-depth") > 1,
-                   "--type amun does not currently support multiple decoder "
-                   "layers, use --type s2s");
-    UTIL_THROW_IF2(options_->get<int>("dec-cell-base-depth") != 2,
-                   "--type amun does not currently support multiple decoder "
-                   "base cells, use --type s2s");
-    UTIL_THROW_IF2(options_->get<int>("dec-cell-high-depth") > 1,
-                   "--type amun does not currently support multiple decoder "
-                   "high cells, use --type s2s");
-    UTIL_THROW_IF2(options_->get<std::string>("enc-cell") != "gru",
-                   "--type amun does not currently support other rnn cells than gru, "
-                   "use --type s2s");
-    UTIL_THROW_IF2(options_->get<std::string>("dec-cell") != "gru",
-                   "--type amun does not currently support other rnn cells than gru, "
-                   "use --type s2s");
-
+  Amun(Ptr<Options> options) : EncoderDecoder(options) {
+    ABORT_IF(opt<int>("enc-depth") > 1,
+             "--type amun does not currently support multiple encoder "
+             "layers, use --type s2s");
+    ABORT_IF(opt<int>("enc-cell-depth") > 1,
+             "--type amun does not currently support stacked encoder "
+             "cells, use --type s2s");
+    ABORT_IF(opt<bool>("skip"),
+             "--type amun does not currently support skip connections, "
+             "use --type s2s");
+    ABORT_IF(opt<int>("dec-depth") > 1,
+             "--type amun does not currently support multiple decoder "
+             "layers, use --type s2s");
+    ABORT_IF(opt<int>("dec-cell-base-depth") != 2,
+             "--type amun does not currently support multiple decoder "
+             "base cells, use --type s2s");
+    ABORT_IF(opt<int>("dec-cell-high-depth") > 1,
+             "--type amun does not currently support multiple decoder "
+             "high cells, use --type s2s");
+    ABORT_IF(opt<std::string>("enc-cell") != "gru",
+             "--type amun does not currently support other rnn cells than gru, "
+             "use --type s2s");
+    ABORT_IF(opt<std::string>("dec-cell") != "gru",
+             "--type amun does not currently support other rnn cells than gru, "
+             "use --type s2s");
   }
 
   void load(Ptr<ExpressionGraph> graph, const std::string& name) {
     using namespace keywords;
 
-    LOG(info)->info("Loading model from {}", name);
+    LOG(info, "Loading model from {}", name);
 
     auto numpy = cnpy::npz_load(name);
 
@@ -93,6 +90,9 @@ public:
            {"encoder_r_gamma1", "encoder_bi_r_gamma1"},
            {"encoder_r_gamma2", "encoder_bi_r_gamma2"}};
 
+    if(opt<bool>("tied-embeddings-src") || opt<bool>("tied-embeddings-all"))
+      nameMap["Wemb"] = "Wemb";
+
     graph->setReloaded(false);
 
     for(auto it : numpy) {
@@ -105,9 +105,11 @@ public:
 
       Shape shape;
       if(numpy[name].shape.size() == 2) {
+        shape.resize(2);
         shape.set(0, numpy[name].shape[0]);
         shape.set(1, numpy[name].shape[1]);
       } else if(numpy[name].shape.size() == 1) {
+        shape.resize(2);
         shape.set(0, 1);
         shape.set(1, numpy[name].shape[0]);
       }
@@ -124,33 +126,8 @@ public:
 
   void save(Ptr<ExpressionGraph> graph,
             const std::string& name,
-            bool saveTranslatorConfig) {
-    save(graph, name);
-
-    if(saveTranslatorConfig) {
-      YAML::Node amun;
-      auto vocabs = options_->get<std::vector<std::string>>("vocabs");
-      amun["source-vocab"] = vocabs[0];
-      amun["target-vocab"] = vocabs[1];
-      amun["devices"] = options_->get<std::vector<int>>("devices");
-      amun["normalize"] = true;
-      amun["beam-size"] = 12;
-      amun["relative-paths"] = false;
-
-      amun["scorers"]["F0"]["path"] = name;
-      amun["scorers"]["F0"]["type"] = "Nematus";
-      amun["weights"]["F0"] = 1.0f;
-
-      OutputFileStream out(name + ".amun.yml");
-      (std::ostream&)out << amun;
-    }
-  }
-
-  void save(Ptr<ExpressionGraph> graph, const std::string& name) {
-    LOG(info)->info("Saving model to {}", name);
-
-    unsigned shape[2];
-    std::string mode = "w";
+            bool saveTranslatorConfig = false) {
+    LOG(info, "Saving model to {}", name);
 
     std::map<std::string, std::string> nameMap
         = {{"decoder_cell1_U", "decoder_U"},
@@ -200,6 +177,9 @@ public:
 
     graph->getBackend()->setDevice(graph->getDevice());
 
+    unsigned shape[2];
+    std::string mode = "w";
+
     for(auto p : graph->params()->getMap()) {
       std::vector<float> v;
       p.second->val() >> v;
@@ -226,7 +206,31 @@ public:
     shape[0] = 1;
     cnpy::npz_save(name, "decoder_c_tt", &ctt, shape, 1, mode);
 
-    options_->saveModelParameters(name);
+    saveModelParameters(name);
+
+    if(saveTranslatorConfig) {
+      createAmunConfig(name);
+      createDecoderConfig(name);
+    }
+  }
+
+private:
+  void createAmunConfig(const std::string& name) {
+    YAML::Node amun;
+    auto vocabs = options_->get<std::vector<std::string>>("vocabs");
+    amun["source-vocab"] = vocabs[0];
+    amun["target-vocab"] = vocabs[1];
+    amun["devices"] = options_->get<std::vector<int>>("devices");
+    amun["normalize"] = opt<float>("normalize") > 0;
+    amun["beam-size"] = opt<size_t>("beam-size");
+    amun["relative-paths"] = false;
+
+    amun["scorers"]["F0"]["path"] = name;
+    amun["scorers"]["F0"]["type"] = "Nematus";
+    amun["weights"]["F0"] = 1.0f;
+
+    OutputFileStream out(name + ".amun.yml");
+    (std::ostream&)out << amun;
   }
 };
 }

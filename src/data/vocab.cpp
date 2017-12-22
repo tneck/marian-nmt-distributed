@@ -5,7 +5,6 @@
 
 #include "3rd_party/exception.h"
 #include "3rd_party/yaml-cpp/yaml.h"
-#include "common/file_stream.h"
 #include "common/logging.h"
 #include "common/utils.h"
 #include "data/vocab.h"
@@ -52,7 +51,7 @@ std::vector<std::string> Vocab::operator()(const Words& sentence,
 }
 
 const std::string& Vocab::operator[](size_t id) const {
-  UTIL_THROW_IF2(id >= id2str_.size(), "Unknown word id: " << id);
+  ABORT_IF(id >= id2str_.size(), "Unknown word id: ", id);
   return id2str_[id];
 }
 
@@ -60,29 +59,31 @@ size_t Vocab::size() const {
   return id2str_.size();
 }
 
-void Vocab::loadOrCreate(const std::string& vocabPath,
-                         const std::string& trainPath,
-                         int max) {
+int Vocab::loadOrCreate(const std::string& vocabPath,
+                        const std::string& trainPath,
+                        int max) {
   if(vocabPath.empty()) {
     if(boost::filesystem::exists(trainPath + ".json")) {
-      load(trainPath + ".json", max);
-      return;
+      return load(trainPath + ".json", max);
     }
     if(boost::filesystem::exists(trainPath + ".yml")) {
-      load(trainPath + ".yml", max);
-      return;
+      return load(trainPath + ".yml", max);
     }
-    create(trainPath + ".yml", max, trainPath);
-    load(trainPath + ".yml", max);
+    create(trainPath + ".yml", trainPath);
+    return load(trainPath + ".yml", max);
   } else {
     if(!boost::filesystem::exists(vocabPath))
-      create(vocabPath, max, trainPath);
-    load(vocabPath, max);
+      create(vocabPath, trainPath);
+    return load(vocabPath, max);
   }
 }
 
-void Vocab::load(const std::string& vocabPath, int max) {
-  LOG(data)->info("Loading vocabulary from {}", vocabPath);
+int Vocab::load(const std::string& vocabPath, int max) {
+  LOG(info, "[data] Loading vocabulary from {}", vocabPath);
+  ABORT_IF(!boost::filesystem::exists(vocabPath),
+           "Vocabulary {} does not exits",
+           vocabPath);
+
   YAML::Node vocab = YAML::Load(InputFileStream(vocabPath));
 
   std::unordered_set<Word> seenSpecial;
@@ -102,12 +103,14 @@ void Vocab::load(const std::string& vocabPath, int max) {
       id2str_[id] = str;
     }
   }
-  UTIL_THROW_IF2(id2str_.empty(), "Empty vocabulary " << vocabPath);
+  ABORT_IF(id2str_.empty(), "Empty vocabulary: ", vocabPath);
 
   id2str_[EOS_ID] = EOS_STR;
   id2str_[UNK_ID] = UNK_STR;
   for(auto id : seenSpecial)
     id2str_[id] = SYM2SPEC.at(id);
+
+  return std::max((int)id2str_.size(), max);
 }
 
 class Vocab::VocabFreqOrderer {
@@ -123,20 +126,35 @@ public:
   }
 };
 
-void Vocab::create(const std::string& vocabPath,
-                   int max,
-                   const std::string& trainPath) {
-  LOG(data)
-      ->info("Creating vocabulary {} from {} (max: {})",
-             vocabPath,
-             trainPath,
-             max);
+void Vocab::create(const std::string& vocabPath, const std::string& trainPath) {
+  LOG(info, "[data] Creating vocabulary {} from {}", vocabPath, trainPath);
 
-  UTIL_THROW_IF2(boost::filesystem::exists(vocabPath),
-                 "Vocab file " << vocabPath << " exists. Not overwriting");
+  boost::filesystem::path path(vocabPath);
+  auto dir = path.parent_path();
+  if(dir.empty())
+    dir = boost::filesystem::current_path();
+
+  ABORT_IF(!dir.empty() && !boost::filesystem::is_directory(dir),
+           "Specified vocab directory {} does not exist",
+           dir);
+
+  ABORT_IF(!dir.empty() && !(boost::filesystem::status(dir).permissions()
+           & boost::filesystem::owner_write),
+           "No write permission in vocab directory {}",
+           dir);
+
+  ABORT_IF(boost::filesystem::exists(vocabPath),
+           "Vocab file '{}' exists. Not overwriting",
+           vocabPath);
 
   InputFileStream trainStrm(trainPath);
+  OutputFileStream vocabStrm(vocabPath);
+  create(trainStrm, vocabStrm);
+}
 
+void Vocab::create(InputFileStream& trainStrm,
+                   OutputFileStream& vocabStrm,
+                   size_t maxSize) {
   std::string line;
   std::unordered_map<std::string, size_t> counter;
 
@@ -178,10 +196,13 @@ void Vocab::create(const std::string& vocabPath,
     if(i > maxSpec)
       maxSpec = i;
 
-  for(size_t i = 0; i < vocabVec.size(); ++i)
+  auto vocabSize = vocabVec.size();
+  if(maxSize > maxSpec)
+    vocabSize = std::min(maxSize - maxSpec - 1, vocabVec.size());
+
+  for(size_t i = 0; i < vocabSize; ++i)
     vocabYaml.force_insert(vocabVec[i], i + maxSpec + 1);
 
-  OutputFileStream vocabStrm(vocabPath);
   (std::ostream&)vocabStrm << vocabYaml;
 }
 }

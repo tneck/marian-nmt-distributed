@@ -23,7 +23,6 @@ private:
 
   Ptr<data::Corpus> corpus_;
   Ptr<Vocab> trgVocab_;
-  // Ptr<LexProbs> lexProbs_;
 
 public:
   TranslateMultiGPU(Ptr<Config> options)
@@ -33,22 +32,27 @@ public:
     auto vocabs = options_->get<std::vector<std::string>>("vocabs");
     trgVocab_->load(vocabs.back());
 
-    // if(options_->has("lexical-table"))
-    //  lexProbs_ = New<LexProbs>(options_,
-    //                       corpus_->getVocabs().front(),
-    //                       trgVocab_);
-
     auto devices = options_->get<std::vector<int>>("devices");
-    for(auto& device : devices) {
-      auto graph = New<ExpressionGraph>(true);
-      graph->setDevice(device);
-      graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
-      graphs_.push_back(graph);
+    ThreadPool threadPool(devices.size(), devices.size());
 
-      auto scorers = createScorers(options);
-      for(auto scorer : scorers)
-        scorer->init(graph);
-      scorers_.push_back(scorers);
+    scorers_.resize(devices.size());
+    graphs_.resize(devices.size());
+    size_t id = 0;
+    for(size_t device : devices) {
+      auto task = [&](size_t device, size_t id) {
+        auto graph = New<ExpressionGraph>(true);
+        graph->setDevice(device);
+        graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
+        graphs_[id] = graph;
+
+        auto scorers = createScorers(options_);
+        for(auto scorer : scorers)
+          scorer->init(graph);
+
+        scorers_[id] = scorers;
+      };
+
+      threadPool.enqueue(task, device, id++);
     }
   }
 
@@ -58,8 +62,10 @@ public:
     auto devices = options_->get<std::vector<int>>("devices");
     ThreadPool threadPool(devices.size(), devices.size());
 
+    size_t batchId = 0;
     auto collector = New<OutputCollector>();
-    size_t sentenceId = 0;
+    if(options_->get<bool>("quiet-translation"))
+        collector->setPrintingStrategy(New<QuietPrinting>());
 
     bg.prepare(false);
 
@@ -77,20 +83,20 @@ public:
         }
 
         auto search = New<Search>(options_, scorers);
-        auto history = search->search(graph, batch, id);
+        auto histories = search->search(graph, batch);
 
-        std::stringstream best1;
-        std::stringstream bestn;
-        Printer(options_, trgVocab_, history, best1, bestn);
-        collector->Write(history->GetLineNum(),
-                         best1.str(),
-                         bestn.str(),
-                         options_->get<bool>("n-best"));
+        for(auto history : histories) {
+          std::stringstream best1;
+          std::stringstream bestn;
+          Printer(options_, trgVocab_, history, best1, bestn);
+          collector->Write(history->GetLineNum(),
+                           best1.str(),
+                           bestn.str(),
+                           options_->get<bool>("n-best"));
+        }
       };
 
-      threadPool.enqueue(task, sentenceId);
-
-      sentenceId++;
+      threadPool.enqueue(task, batchId++);
     }
   }
 };
@@ -146,7 +152,7 @@ public:
     data::BatchGenerator<data::TextInput> bg(corpus_, options_);
 
     auto collector = New<StringCollector>();
-    size_t sentenceId = 0;
+    size_t batchId = 0;
 
     bg.prepare(false);
 
@@ -167,16 +173,18 @@ public:
           }
 
           auto search = New<Search>(options_, scorers);
-          auto history = search->search(graph, batch, id);
+          auto histories = search->search(graph, batch);
 
-          std::stringstream best1;
-          std::stringstream bestn;
-          Printer(options_, trgVocab_, history, best1, bestn);
-          collector->add(history->GetLineNum(), best1.str(), bestn.str());
+          for(auto history : histories) {
+            std::stringstream best1;
+            std::stringstream bestn;
+            Printer(options_, trgVocab_, history, best1, bestn);
+            collector->add(history->GetLineNum(), best1.str(), bestn.str());
+          }
         };
 
-        threadPool_.enqueue(task, sentenceId);
-        sentenceId++;
+        threadPool_.enqueue(task, batchId);
+        batchId++;
       }
     }
 

@@ -3,6 +3,7 @@
 #include "common/config.h"
 #include "data/batch_generator.h"
 #include "graph/expression_graph.h"
+#include "models/model_base.h"
 #include "training/validator.h"
 
 #include "examples/mnist/dataset.h"
@@ -11,39 +12,33 @@ using namespace marian;
 
 namespace marian {
 
-template <class Builder>
-class AccuracyValidator : public Validator<data::MNIST> {
-private:
-  Ptr<Builder> builder_;
-
+class AccuracyValidator : public Validator<data::MNISTData> {
 public:
-  template <class... Args>
-  AccuracyValidator(Ptr<Config> options, Args... args)
-      : Validator(std::vector<Ptr<Vocab>>(), options),
-        builder_(New<Builder>(options, keywords::inference = true, args...)) {
-    initLastBest();
+  AccuracyValidator(Ptr<Config> options)
+      : Validator(std::vector<Ptr<Vocab>>(), options, false) {
+    Ptr<Options> temp = New<Options>();
+    temp->merge(options);
+    temp->set("inference", true);
+    builder_ = models::from_options(temp);
   }
 
-  virtual void keepBest(Ptr<ExpressionGraph> graph) {
-    auto model = options_->get<std::string>("model");
-    builder_->save(graph, model + ".best-" + type() + ".npz", true);
+  virtual void keepBest(const std::vector<Ptr<ExpressionGraph>>& graphs) {
+    LOG(warn, "Keeping best model for MNIST examples is not supported");
   }
-
-  bool lowerIsBetter() { return false; }
 
   std::string type() { return "accuracy"; }
 
 protected:
   virtual float validateBG(
-      Ptr<ExpressionGraph> graph,
-      Ptr<data::BatchGenerator<data::MNIST>> batchGenerator) {
+      const std::vector<Ptr<ExpressionGraph>>& graphs,
+      Ptr<data::BatchGenerator<data::MNISTData>> batchGenerator) {
     float correct = 0;
     size_t samples = 0;
 
     while(*batchGenerator) {
       auto batch = batchGenerator->next();
-      auto probs = builder_->build(graph, batch);
-      graph->forward();
+      auto probs = builder_->build(graphs[0], batch, true);
+      graphs[0]->forward();
 
       std::vector<float> scores;
       probs->val()->get(scores);

@@ -6,8 +6,8 @@
 
 #include "kernels/cuda_helpers.h"
 #include "kernels/tensor_operators.h"
-#include "layers/word2vec_reader.h"
 #include "layers/param_initializers.h"
+#include "layers/word2vec_reader.h"
 #include "svd/svd.h"
 
 namespace marian {
@@ -89,8 +89,8 @@ void svd(std::vector<float>& vec, Shape shape) {
   int n = std::min(rows, cols);
   int m = std::max(rows, cols);
 
-  UTIL_THROW_IF2(m % n != 0,
-                 "Matrix dimensions must be equal or multiples of each other");
+  ABORT_IF(m % n != 0,
+           "Matrix dimensions must be equal or multiples of each other");
 
   for(int i = 0; i < shape.elements(); i += n * n) {
     std::vector<float> t1(n);
@@ -142,10 +142,12 @@ std::function<void(Tensor)> from_word2vec(const std::string& file,
                                           int dimVoc,
                                           int dimEmb,
                                           bool normalize /*= false*/) {
+  using namespace functional;
+
   return [file, dimVoc, dimEmb, normalize](Tensor t) {
     auto embs = Word2VecReader().read(file, dimVoc, dimEmb);
     t->set(embs);
-    if(normalize){
+    if(normalize) {
       float l2Norm = L2Norm(t);
       if(l2Norm != 0)
         Element(_1 = _1 / l2Norm, t);

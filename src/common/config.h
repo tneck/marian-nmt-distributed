@@ -1,9 +1,8 @@
 #pragma once
 
-#include <boost/program_options.hpp>
 #include <sys/ioctl.h>
 #include <unistd.h>
-//#include <random>
+#include <boost/program_options.hpp>
 
 #include "3rd_party/yaml-cpp/yaml.h"
 #include "common/config_parser.h"
@@ -46,31 +45,8 @@ public:
     config_ = parser.getConfig();
     createLoggers(this);
 
-    modelFeatures_ = {
-        "type",
-        "dim-vocabs",
-        "dim-emb",
-        "dim-rnn",
-        "enc-cell",
-        "enc-type",
-        "enc-cell-depth",
-        "enc-depth",
-        "dec-depth",
-        "dec-cell",
-        "dec-cell-base-depth",
-        "dec-cell-high-depth",
-        //"dec-high-context",
-        "skip",
-        "layer-normalization",
-        "special-vocab",
-        "tied-embeddings",
-        "tied-embeddings-src",
-        "tied-embeddings-all"
-        /*"lexical-table", "vocabs"*/
-    };
-
     if(get<size_t>("seed") == 0)
-      seed = (size_t)time(0)/* + std::random_device{}()*/;
+      seed = (size_t)time(0);
     else
       seed = get<size_t>("seed");
 
@@ -78,25 +54,25 @@ public:
       if(boost::filesystem::exists(get<std::string>("model"))
          && !get<bool>("no-reload")) {
         try {
-          loadModelParameters(get<std::string>("model"));
+          if(!get<bool>("ignore-model-config"))
+            loadModelParameters(get<std::string>("model"));
         } catch(std::runtime_error& e) {
-          LOG(info)->info("No model settings found in model file");
+          LOG(info, "[config] No model configuration found in model file");
         }
       }
     } else {
       auto model = get<std::vector<std::string>>("models")[0];
       try {
-        loadModelParameters(model);
+        if(!get<bool>("ignore-model-config"))
+          loadModelParameters(model);
       } catch(std::runtime_error& e) {
-        LOG(info)->info("No model settings found in model file");
+        LOG(info, "[config] No model configuration found in model file");
       }
     }
     log();
   }
 
-  Config(const Config& other)
-      : config_(YAML::Clone(other.config_)),
-        modelFeatures_(other.modelFeatures_) {}
+  Config(const Config& other) : config_(YAML::Clone(other.config_)) {}
 
   bool has(const std::string& key) const;
 
@@ -118,27 +94,29 @@ public:
 
   YAML::Node getModelParameters();
   void loadModelParameters(const std::string& name);
-  void saveModelParameters(const std::string& name);
 
   void save(const std::string& name) {
     OutputFileStream out(name);
     (std::ostream&)out << *this;
   }
 
-  template <class OStream>
-  friend OStream& operator<<(OStream& out, const Config& config) {
+  friend std::ostream& operator<<(std::ostream& out, const Config& config) {
     YAML::Emitter outYaml;
     OutputYaml(config.get(), outYaml);
     out << outYaml.c_str();
     return out;
   }
 
+  static void AddYamlToNpz(const YAML::Node&,
+                           const std::string&,
+                           const std::string&);
+
 private:
   YAML::Node config_;
-  std::vector<std::string> modelFeatures_;
 
-  void GetYamlFromNpz(YAML::Node&, const std::string&, const std::string&);
-  void AddYamlToNpz(const YAML::Node&, const std::string&, const std::string&);
+  static void GetYamlFromNpz(YAML::Node&,
+                             const std::string&,
+                             const std::string&);
 
   void override(const YAML::Node& params);
 
