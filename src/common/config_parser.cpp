@@ -467,7 +467,9 @@ void ConfigParser::addOptionsTraining(po::options_description& desc) {
       ->zero_tokens()
       ->default_value(false),
      "Fix target embeddings. Affects all decoders")
-    ("multi-node", po::value<bool>()->default_value(false),
+    ("multi-node", po::value<bool>()
+      ->zero_tokens()
+      ->default_value(false),
     "Enable multi-noded training")
   ;
   // clang-format on
