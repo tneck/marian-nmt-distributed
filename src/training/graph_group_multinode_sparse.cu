@@ -4,31 +4,24 @@
 
 namespace marian {
 
-void MultiNodeSparseGraphGroup::initServerShard(bool initFullSendReceiveBuffer) {
-  MultiNodeGraphGroup::initServerShard(false);
-
+void MultiNodeSparseGraphGroup::initServerShards(bool initFullSendReceiveBuffer) {
+  MultiNodeGraphGroup::initServerShards(false);
   // Initialize sizes of clients of every node in cluster
   setupClientSizesOfNodes();
-
   // Initialize last communicated parameters and delta buffers for all clients of this shard
-
   size_t thisNodeSize = this->nodeShardSizes_[this->mpi_my_rank_];
   size_t gpuShardSize = ceilf(((float) thisNodeSize) / this->devices_.size());
   size_t offset = 0;
-
   for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
     size_t size = std::min(gpuShardSize, thisNodeSize - offset);
-
     tmpDeltas_.push_back(MultiNodeGraphGroup::newTensor(size, this->devices_[gpu]));
     int sparseCap = this->graphs_[0]->params()->vals()->size() * 1.2 * (1.0 - dropRate_); // (Estimated) Max size of sparse buffers
-
     // Server side
     shardSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu]))); // @TODO: Sparse sizes can be optimised further
     tmpSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
     // Client side
     localSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
     localSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
-
     // Initialize parameters communicated with all external clients of this server shard (to compute deltas) + gradient droppers
     std::vector<std::vector<Tensor>> extClientParams; // parameters stored for external clients
     std::vector<std::vector<GradientDrop>> extClientDroppers;
@@ -49,10 +42,8 @@ void MultiNodeSparseGraphGroup::initServerShard(bool initFullSendReceiveBuffer) 
     clientsParams_.push_back(extClientParams);
     fetchDroppers_.push_back(extClientDroppers); // fetchDroppers_[shard][node][client]
     gradientDroppers_.push_back(shardDroppers);
-
     offset += size;
   }
-
   // Initialize send/receive buffers
   serverShardSparseBuffer1_ = std::vector<int>(this->nodeShardSizes_[this->mpi_my_rank_]); // @ TODO: Should actually be sparse(X) instead of X but this causes very sporadic crashes
   serverShardSparseBuffer2_ = std::vector<float>(this->nodeShardSizes_[this->mpi_my_rank_]);
@@ -79,8 +70,8 @@ void MultiNodeSparseGraphGroup::setupClientSizesOfNodes() {
   }
 }
 
-void MultiNodeSparseGraphGroup::initRemoteCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
-  MultiNodeGraphGroup::initRemoteCommunicationVars(false);
+void MultiNodeSparseGraphGroup::initClientCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
+  MultiNodeGraphGroup::initClientCommunicationVars(false);
   for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
     size_t size = this->nodeShardSizes_[this->mpi_my_rank_] * 3 * (1.0 - min(0.99, dropRate_));
     clientShardSparseBuffer1_.push_back(std::vector<int>(size));
@@ -88,7 +79,7 @@ void MultiNodeSparseGraphGroup::initRemoteCommunicationVars(bool initBuffers) { 
   }
 }
 
-void MultiNodeSparseGraphGroup::launchServerShardThread() {
+void MultiNodeSparseGraphGroup::launchServerThread() {
   #if MPI_FOUND
   this->serverShardThread_ = new std::thread([this] {
     int nCommunicatingNodes = this->mpi_comm_world_size_; // keep track of number of nodes still communicating with this shard

@@ -32,12 +32,12 @@ void MultiNodeGraphGroup::initFirstRun(Ptr<data::Batch> batch) {
     );
   }
   cudaStreamSynchronize(0);
-  // Initialize variables for server shard
-  initServerShard();
+  // Initialize variables for server shard(s) on this node
+  initServerShards();
   // Initialize client variables for inter-node communication
-  initRemoteCommunicationVars();
-  // Launch server shard thread to communicate with clients
-  launchServerShardThread();
+  initClientCommunicationVars();
+  // Launch server thread to communicate with clients
+  launchServerThread();
   // Launch compute/communicate overlap threads if enabled
   if (commOverlap_) {
     launchCommOverlapThreads();
@@ -51,7 +51,7 @@ void MultiNodeGraphGroup::initMPI() {
 #endif
 }
 
-void MultiNodeGraphGroup::initServerShard(bool initFullSendReceiveBuffer) {
+void MultiNodeGraphGroup::initServerShards(bool initFullSendReceiveBuffer) {
   // Initialize server shard sizes for all nodes (remote + current)
   size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
   size_t nodeShardSize = ceilf(((float) totalParamsGradsSize) / mpi_comm_world_size_);
@@ -103,7 +103,7 @@ void MultiNodeGraphGroup::setupClientsOfNodesAndDevices() {
   }
 }
 
-void MultiNodeGraphGroup::initRemoteCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
+void MultiNodeGraphGroup::initClientCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
   for (int gpu = 0; gpu < devices_.size(); gpu++) {
     if (initBuffers) {
       size_t size = nodeShardSizes_[mpi_my_rank_];
@@ -127,7 +127,7 @@ void MultiNodeGraphGroup::initRemoteCommunicationVars(bool initBuffers) { // @TO
   }
 }
 
-void MultiNodeGraphGroup::launchServerShardThread() {
+void MultiNodeGraphGroup::launchServerThread() {
 #if MPI_FOUND
   serverShardThread_ = new std::thread([this] {
     int nCommunicatingNodes = mpi_comm_world_size_; // keep track of number of nodes still communicating with this shard

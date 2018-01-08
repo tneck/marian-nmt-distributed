@@ -136,7 +136,7 @@ protected:
   /**
    * @brief Initialize server shard, i.e. sizes, parameters, gradients and buffers
    */
-  virtual void initServerShard(bool initFullSendReceiveBuffer = true);
+  virtual void initServerShards(bool initFullSendReceiveBuffer = true);
 
   /**
    * @brief Get number of clients of every node by communicating with all nodes in cluster @TODO: Communication will not be necessary once run-time option is implemented
@@ -146,12 +146,12 @@ protected:
   /**
    * @brief Initialize client buffers for remote communication (synchronisation)
    */
-  virtual void initRemoteCommunicationVars(bool initBuffers = true);
+  virtual void initClientCommunicationVars(bool initBuffers = true);
 
   /*
    * @brief Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters
    */
-  virtual void launchServerShardThread();
+  virtual void launchServerThread();
 
   /**
    * @brief Send new gradients to the server shards and receive the updated (global) parameters

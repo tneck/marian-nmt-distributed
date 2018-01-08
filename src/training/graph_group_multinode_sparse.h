@@ -52,9 +52,9 @@ private:
   std::vector<Tensor> tmpDeltas_;
 
   /**
-   * @brief Initialize server shard, i.e. sizes, parameters, gradients and buffers
+   * @brief Initialize server shards on this node, i.e. sizes, parameters, gradients and buffers
    */
-  virtual void initServerShard(bool initFullSendReceiveBuffer);
+  virtual void initServerShards(bool initFullSendReceiveBuffer);
 
   /**
    * @brief Determine size for all clients of every node
@@ -64,12 +64,12 @@ private:
   /**
    * @brief Initialize client buffers for remote communication (synchronisation)
    */
-  virtual void initRemoteCommunicationVars(bool initBuffers);
+  virtual void initClientCommunicationVars(bool initBuffers);
 
   /*
    * @brief Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters
    */
-  virtual void launchServerShardThread();
+  virtual void launchServerThread();
 
   /**
    * @brief Send new gradients to the server shards and receive the updated (global) parameters
