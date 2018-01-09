@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
 
   bool useMultiNode = options->get<bool>("multi-node") && configureMPI(argc, argv);
 
-  if(true || useMultiNode) {
+  if(useMultiNode) {
     if(options->get<double>("multi-node-drop-rate")) {
 //      LOG(info)->info("Launching Multi-Node Sparse Graph Group");
       LOG(info, "Launching Multi-Node Sparse Graph Group");
@@ -58,8 +58,9 @@ bool configureMPI(int argc, char** argv) {
   MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_mode);
   MPI_Comm_set_errhandler(MPI_COMM_WORLD, MPI_ERRORS_RETURN); // Enable if occasional truncation errors
   MPI_Comm_size(MPI_COMM_WORLD, &comm_world_size);
+  ABORT_IF(provided_thread_mode < MPI_THREAD_MULTIPLE, "Your version of MPI does not support multiple threads.");
   #endif
-  return comm_world_size > 1 && provided_thread_mode >= MPI_THREAD_MULTIPLE;
+  return comm_world_size > 1;
 }
 
 void terminateMPI() {
