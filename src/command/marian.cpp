@@ -26,11 +26,9 @@ int main(int argc, char** argv) {
 
   if(useMultiNode) {
     if(options->get<double>("multi-node-drop-rate")) {
-//      LOG(info)->info("Launching Multi-Node Sparse Graph Group");
       LOG(info, "Launching Multi-Node Sparse Graph Group");
       New<Train<MultiNodeSparseGraphGroup>>(options)->run();
     } else {
-//      LOG(info)->info("Launching Multi-Node Graph Group");
       LOG(info, "Launching Multi-Node Graph Group");
       New<Train<MultiNodeGraphGroup>>(options)->run();
     }
