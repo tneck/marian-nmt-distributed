@@ -117,12 +117,10 @@ void MultiNodeGraphGroup::initClientCommunicationVars(bool initBuffers) { // @TO
       Element(functional::_1 = 0, sumGrads);
       cudaStreamSynchronize(0);
       gpuSummedGrads_.push_back(sumGrads);
-      // Communication gradients buffer
-      commBufferGrads_.push_back(newTensor(fullSize, devices_[gpu]));
-      // Communication parameters buffer
-      Tensor bufferParams = newTensor(fullSize, devices_[gpu]);
-      bufferParams->copyFrom(graphs_[0]->params()->vals());
-      commBufferParams_.push_back(bufferParams);
+      // Communication overlap buffer (for grads + params)
+      Tensor commBuffer = newTensor(fullSize, devices_[gpu]);
+      commBuffer->copyFrom(graphs_[0]->params()->vals());
+      commBuffers_.push_back(commBuffer);
     }
   }
 }
@@ -189,10 +187,11 @@ void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor ol
     // Update remotely if node != this node
     if (node != mpi_my_rank_) {
 
-      // Copy grads from GPU
+      // Copy grads from GPU to CPU (for MPI sending)
       cudaMemcpy(clientCommBufferGrads_[gpu].data(), newGrads->subtensor(offset, nodeSize)->data(), nodeSize * sizeof(float), cudaMemcpyDeviceToHost);
       cudaStreamSynchronize(0);
 
+      // Send grads and receive params to/from server shard
       {
         std::unique_lock<std::mutex> uniqueAccess = (optionalBlockMutex == nullptr) ? std::unique_lock<std::mutex>() : std::unique_lock<std::mutex>(*optionalBlockMutex, std::try_to_lock); // Lock mutex if provided
 
@@ -206,8 +205,7 @@ void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor ol
         MPI_Ssend(clientCommBufferGrads_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
 
         // Receive updated params from server
-        MPI_Recv(clientCommBufferParams_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD,
-                 MPI_STATUS_IGNORE);
+        MPI_Recv(clientCommBufferParams_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
       }
 
       // Copy params to GPU
@@ -263,7 +261,7 @@ void MultiNodeGraphGroup::launchCommOverlapThreads() {
         if (stopClientCommThreads_) { break; }
 
         // Synchronize with server shards
-        synchronizeWithServerShards(commBufferGrads_[gpu], commBufferParams_[gpu], gpu, scaleLearningRate_ ? gpuCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
+        synchronizeWithServerShards(commBuffers_[gpu], commBuffers_[gpu], gpu, scaleLearningRate_ ? gpuCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
 
         // Indicate that buffers can be read from and filled again
         commBuffersFilled_[gpu] = false;
@@ -381,28 +379,22 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
       if (!commBuffersFilled_[my_id]) {
         std::unique_lock<std::mutex> tryLock(mutexCommBuffersFilled_[my_id], std::try_to_lock);
         if (tryLock.owns_lock()) {
-
-          // Copy summed grads to communication buffer
-          commBufferGrads_[my_id]->copyFrom(gpuSummedGrads_[my_id]);
           // Copy parameters from communication buffer
-          graph->params()->vals()->copyFrom(commBufferParams_[my_id]);
-
+          graph->params()->vals()->copyFrom(commBuffers_[my_id]);
+          // Copy summed grads to communication buffer
+          commBuffers_[my_id]->copyFrom(gpuSummedGrads_[my_id]);
           // Commit summed word counts if batch-flexible-lr enabled
           if (scaleLearningRate_) {
             gpuCommittedWordCounts_[my_id] = gpuSummedWordCounts_[my_id];
             gpuSummedWordCounts_[my_id] = 0;
           }
-
           // Notify communication thread that buffers have been read and filled
           commBuffersFilled_[my_id] = true;
           cvCommBuffersFilled_[my_id].notify_one();
-
           // Apply summed gradients to new parameters
           localOpts_[my_id]->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
-          cudaStreamSynchronize(0);
           // Clear summed gradients
-          Element(functional::_1 = 0, gpuSummedGrads_[my_id]);
-          cudaStreamSynchronize(0);
+          gpuSummedGrads_[my_id]->set(0);
 
           numberComputeIters_[my_id] = 0;
         }

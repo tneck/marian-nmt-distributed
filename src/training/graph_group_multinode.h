@@ -74,7 +74,7 @@ protected:
 
   // Client communication variables
 
-  std::vector<std::vector<float>> clientCommBufferParams_; // per client (GPU)
+  std::vector<std::vector<float>> clientCommBufferParams_; // per client (GPU), stored on CPU
   std::vector<std::vector<float>> clientCommBufferGrads_;
 
   std::vector<int> numberClientsOfNodes_;
@@ -99,8 +99,7 @@ protected:
   std::vector<std::thread*> clientCommThreads_;
   bool stopClientCommThreads_{false};
 
-  std::vector<Tensor> commBufferParams_;
-  std::vector<Tensor> commBufferGrads_;
+  std::vector<Tensor> commBuffers_;
 
   std::vector<Tensor> gpuSummedGrads_;
   std::vector<size_t> gpuSummedWordCounts_;
