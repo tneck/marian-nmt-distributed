@@ -73,7 +73,7 @@ void MultiNodeGraphGroup::initServerShards(bool initFullSendReceiveBuffer) {
     gpuParams->copyFrom(graphs_[0]->params()->vals()->subtensor(offset, size));
     gpuShardsParams_.push_back(gpuParams);
     gpuShardsGrads_.push_back(newTensor(size, devices_[gpu]));
-    gpuShardSizes_.push_back(size);
+    localSubShardSizes_.push_back(size);
     offset += size;
   }
 
@@ -107,8 +107,7 @@ void MultiNodeGraphGroup::initClientCommunicationVars(bool initBuffers) { // @TO
   for (int gpu = 0; gpu < devices_.size(); gpu++) {
     if (initBuffers) {
       size_t size = nodeShardSizes_[mpi_my_rank_];
-      clientCommBufferParams_.push_back(std::vector<float>(size));
-      clientCommBufferGrads_.push_back(std::vector<float>(size));
+      clientCommBuffersCPU_.push_back(std::vector<float>(size));
     }
     if (commOverlap_) {
       size_t fullSize = graphs_[0]->params()->vals()->size();
@@ -116,11 +115,11 @@ void MultiNodeGraphGroup::initClientCommunicationVars(bool initBuffers) { // @TO
       Tensor sumGrads = newTensor(fullSize, devices_[gpu]);
       Element(functional::_1 = 0, sumGrads);
       cudaStreamSynchronize(0);
-      gpuSummedGrads_.push_back(sumGrads);
+      clientSummedGradsGPU.push_back(sumGrads);
       // Communication overlap buffer (for grads + params)
       Tensor commBuffer = newTensor(fullSize, devices_[gpu]);
       commBuffer->copyFrom(graphs_[0]->params()->vals());
-      commBuffers_.push_back(commBuffer);
+      clientCommOverlapBuffersGPU_.push_back(commBuffer);
     }
   }
 }
@@ -144,7 +143,7 @@ void MultiNodeGraphGroup::launchServerThread() {
       std::vector<std::thread> threads;
       size_t offset = 0;
       for (int gpu = 0; gpu < devices_.size(); gpu++) {
-        size_t size = gpuShardSizes_[gpu];
+        size_t size = localSubShardSizes_[gpu];
 
         threads.emplace_back(std::thread([=](int gpu, size_t offset, size_t size, size_t batchWords) {
           std::lock_guard<std::mutex> guard(mutexGpuShards_[gpu]);
@@ -188,7 +187,7 @@ void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor ol
     if (node != mpi_my_rank_) {
 
       // Copy grads from GPU to CPU (for MPI sending)
-      cudaMemcpy(clientCommBufferGrads_[gpu].data(), newGrads->subtensor(offset, nodeSize)->data(), nodeSize * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(clientCommBuffersCPU_[gpu].data(), newGrads->subtensor(offset, nodeSize)->data(), nodeSize * sizeof(float), cudaMemcpyDeviceToHost);
       cudaStreamSynchronize(0);
 
       // Send grads and receive params to/from server shard
@@ -202,24 +201,24 @@ void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor ol
         messageInfo[MSG_INFO_BATCHWORDS_] = batchWords;
         messageInfo[MSG_INFO_STATUS_] = STATUS_NODE_TRAINING_;
         MPI_Ssend(&messageInfo, 4, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
-        MPI_Ssend(clientCommBufferGrads_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
+        MPI_Ssend(clientCommBuffersCPU_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
 
         // Receive updated params from server
-        MPI_Recv(clientCommBufferParams_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(clientCommBuffersCPU_[gpu].data(), nodeSize, MPI_FLOAT, node, MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
       }
 
-      // Copy params to GPU
-      cudaMemcpy(oldParams->subtensor(offset, nodeSize)->data(), clientCommBufferParams_[gpu].data(), nodeSize * sizeof(float), cudaMemcpyHostToDevice);
+      // Copy params from CPU back to GPU
+      cudaMemcpy(oldParams->subtensor(offset, nodeSize)->data(), clientCommBuffersCPU_[gpu].data(), nodeSize * sizeof(float), cudaMemcpyHostToDevice);
       cudaStreamSynchronize(0);
 
 
-      // Update locally if node == this node
+    // Else update locally if node == this node
     } else {
       size_t localOffset = offset;
       std::vector<std::thread> threads;
 
       for (int gpu = 0; gpu < devices_.size(); gpu++) {
-        size_t gpuSize = gpuShardSizes_[gpu];
+        size_t gpuSize = localSubShardSizes_[gpu];
 
         threads.emplace_back(std::thread([=](int gpu, size_t offset, size_t size) {
           std::lock_guard<std::mutex> guard(mutexGpuShards_[gpu]);
@@ -253,18 +252,18 @@ void MultiNodeGraphGroup::launchCommOverlapThreads() {
     clientCommThreads_.emplace_back(new std::thread([this](int gpu) {
       do {
         // Wait for GPU (client) to fill buffers pointers
-        std::unique_lock<std::mutex> uniqueLock(mutexCommBuffersFilled_[gpu]);
-        while (!commBuffersFilled_[gpu]) {
-          cvCommBuffersFilled_[gpu].wait(uniqueLock);
+        std::unique_lock<std::mutex> uniqueLock(mutexClientCommOverlapBuffersFilled_[gpu]);
+        while (!clientCommOverlapBuffersFilled_[gpu]) {
+          cvClientCommOverlapBuffersFilled_[gpu].wait(uniqueLock);
         }
 
         if (stopClientCommThreads_) { break; }
 
         // Synchronize with server shards
-        synchronizeWithServerShards(commBuffers_[gpu], commBuffers_[gpu], gpu, scaleLearningRate_ ? gpuCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
+        synchronizeWithServerShards(clientCommOverlapBuffersGPU_[gpu], clientCommOverlapBuffersGPU_[gpu], gpu, scaleLearningRate_ ? clientCommittedWordCounts_[gpu] : 0, commOverlapSingleActive_ ? &mutexCommChannel_ : nullptr);
 
         // Indicate that buffers can be read from and filled again
-        commBuffersFilled_[gpu] = false;
+        clientCommOverlapBuffersFilled_[gpu] = false;
 
       } while (!stopClientCommThreads_);
     }, gpu));
@@ -362,39 +361,39 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
     if (commOverlap_) {
 
       // Add computed gradients to local running sum
-      Element(functional::_1 = functional::_1 + functional::_2, gpuSummedGrads_[my_id], gradients);
+      Element(functional::_1 = functional::_1 + functional::_2, clientSummedGradsGPU[my_id], gradients);
       cudaStreamSynchronize(0);
       // Sum up word counts if batch flexible learning rate is enabled
       if (scaleLearningRate_) {
-        gpuSummedWordCounts_[my_id] += numSeenWords;
+        clientSummedWordCounts_[my_id] += numSeenWords;
       }
 
       // If reached max number of compute iterations per synchronisation, wait for communication channel to finish syncing
-      if (maxNumberComputeIters_ != -1 && ++numberComputeIters_[my_id] >= maxNumberComputeIters_) {
-        std::lock_guard<std::mutex> wait(mutexCommBuffersFilled_[my_id]);
+      if (maxNumberComputeItersPerSync_ != -1 && ++numberComputeIters_[my_id] >= maxNumberComputeItersPerSync_) {
+        std::lock_guard<std::mutex> wait(mutexClientCommOverlapBuffersFilled_[my_id]);
         numberComputeIters_[my_id] = 0;
       }
 
       // If communication channel ready, swap graph's pointers with secondary buffers
-      if (!commBuffersFilled_[my_id]) {
-        std::unique_lock<std::mutex> tryLock(mutexCommBuffersFilled_[my_id], std::try_to_lock);
+      if (!clientCommOverlapBuffersFilled_[my_id]) {
+        std::unique_lock<std::mutex> tryLock(mutexClientCommOverlapBuffersFilled_[my_id], std::try_to_lock);
         if (tryLock.owns_lock()) {
           // Copy parameters from communication buffer
-          graph->params()->vals()->copyFrom(commBuffers_[my_id]);
+          graph->params()->vals()->copyFrom(clientCommOverlapBuffersGPU_[my_id]);
           // Copy summed grads to communication buffer
-          commBuffers_[my_id]->copyFrom(gpuSummedGrads_[my_id]);
+          clientCommOverlapBuffersGPU_[my_id]->copyFrom(clientSummedGradsGPU[my_id]);
           // Commit summed word counts if batch-flexible-lr enabled
           if (scaleLearningRate_) {
-            gpuCommittedWordCounts_[my_id] = gpuSummedWordCounts_[my_id];
-            gpuSummedWordCounts_[my_id] = 0;
+            clientCommittedWordCounts_[my_id] = clientSummedWordCounts_[my_id];
+            clientSummedWordCounts_[my_id] = 0;
           }
           // Notify communication thread that buffers have been read and filled
-          commBuffersFilled_[my_id] = true;
-          cvCommBuffersFilled_[my_id].notify_one();
+          clientCommOverlapBuffersFilled_[my_id] = true;
+          cvClientCommOverlapBuffersFilled_[my_id].notify_one();
           // Apply summed gradients to new parameters
-          localOpts_[my_id]->update(graph->params()->vals(), gpuSummedGrads_[my_id]);
+          clientLocalOpts_[my_id]->update(graph->params()->vals(), clientSummedGradsGPU[my_id]);
           // Clear summed gradients
-          gpuSummedGrads_[my_id]->set(0);
+          clientSummedGradsGPU[my_id]->set(0);
 
           numberComputeIters_[my_id] = 0;
         }
@@ -425,8 +424,8 @@ void MultiNodeGraphGroup::shutDownServerShardThread() {
 void MultiNodeGraphGroup::shutDownCommOverlapThreads() {
   stopClientCommThreads_ = true;
   for (int gpu = 0; gpu < devices_.size(); gpu++) {
-    commBuffersFilled_[gpu] = true;
-    cvCommBuffersFilled_[gpu].notify_one(); // Unblock thread from lock, then join it
+    clientCommOverlapBuffersFilled_[gpu] = true;
+    cvClientCommOverlapBuffersFilled_[gpu].notify_one(); // Unblock thread from lock, then join it
     clientCommThreads_[gpu]->join();
   }
 }

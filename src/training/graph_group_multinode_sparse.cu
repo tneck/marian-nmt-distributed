@@ -99,7 +99,7 @@ void MultiNodeSparseGraphGroup::launchServerThread() {
       size_t offset = 0;
       for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
         size_t endOffset = offset;
-        while (endOffset < messageInfo[this->MSG_INFO_SIZE_] && serverShardSparseBuffer1_.at(endOffset) < gpu * this->gpuShardSizes_[0] + this->gpuShardSizes_[gpu]) {
+        while (endOffset < messageInfo[this->MSG_INFO_SIZE_] && serverShardSparseBuffer1_.at(endOffset) < gpu * this->localSubShardSizes_[0] + this->localSubShardSizes_[gpu]) {
           endOffset++;
         }
 
@@ -112,7 +112,7 @@ void MultiNodeSparseGraphGroup::launchServerThread() {
           cudaStreamSynchronize(0);
 
           // Convert back to dense, for all index + offset >= 0
-          shardSparseGrads_[gpu]->toDense(this->gpuShardsGrads_[gpu], -(this->gpuShardSizes_[0] * gpu));
+          shardSparseGrads_[gpu]->toDense(this->gpuShardsGrads_[gpu], -(this->localSubShardSizes_[0] * gpu));
           cudaStreamSynchronize(0);
 
           // Run optimizer on GPU

@@ -74,15 +74,14 @@ protected:
 
   // Client communication variables
 
-  std::vector<std::vector<float>> clientCommBufferParams_; // per client (GPU), stored on CPU
-  std::vector<std::vector<float>> clientCommBufferGrads_;
+  std::vector<std::vector<float>> clientCommBuffersCPU_;
 
   std::vector<int> numberClientsOfNodes_;
 
-  std::vector<size_t> nodeShardSizes_;
-  std::vector<size_t> gpuShardSizes_;
+  std::vector<size_t> nodeShardSizes_; // Number of params allocated to each node
+  std::vector<size_t> localSubShardSizes_; // Number of params allocated to shards on this node
 
-  std::vector<int> multiNodeDevices_;
+  std::vector<int> multiNodeDevices_; // Specifies the GPU configuration of all nodes (e.g. [2 0 1 1 0] = 2 GPUs on first node: devices 0 and 1, plus 1 GPU on second node: device 0)
 
   static const unsigned int MSG_INFO_SIZE_{0}, MSG_INFO_CLIENT_{1}, MSG_INFO_BATCHWORDS_{2}, MSG_INFO_STATUS_{3};
   static const unsigned int STATUS_NODE_TRAINING_{0}, STATUS_NODE_FINISHED_{1};
@@ -90,7 +89,7 @@ protected:
   // Computations/communication overlap variables
 
   bool commOverlap_; // Overlapping computation during communication
-  int maxNumberComputeIters_; // Max number of compute iterations that a node can do per synchronisation
+  int maxNumberComputeItersPerSync_; // Max number of compute iterations that a node can do per synchronisation
   std::vector<size_t> numberComputeIters_; // Current number of compute iterations of each client since last synchronisation
 
   bool commOverlapSingleActive_; // Whether only one overlap thread can use communication channel at any time
@@ -99,16 +98,16 @@ protected:
   std::vector<std::thread*> clientCommThreads_;
   bool stopClientCommThreads_{false};
 
-  std::vector<Tensor> commBuffers_;
+  std::vector<Tensor> clientSummedGradsGPU;
+  std::vector<size_t> clientSummedWordCounts_;
+  std::vector<size_t> clientCommittedWordCounts_;
+  std::vector<Ptr<OptimizerBase>> clientLocalOpts_;
 
-  std::vector<Tensor> gpuSummedGrads_;
-  std::vector<size_t> gpuSummedWordCounts_;
-  std::vector<size_t> gpuCommittedWordCounts_;
-  std::vector<Ptr<OptimizerBase>> localOpts_;
+  std::vector<Tensor> clientCommOverlapBuffersGPU_;
 
-  std::vector<bool> commBuffersFilled_;
-  std::vector<std::mutex> mutexCommBuffersFilled_;
-  std::vector<std::condition_variable> cvCommBuffersFilled_;
+  std::vector<bool> clientCommOverlapBuffersFilled_;
+  std::vector<std::mutex> mutexClientCommOverlapBuffersFilled_;
+  std::vector<std::condition_variable> cvClientCommOverlapBuffersFilled_;
 
   /**
    * @brief Allocate new tensor on given GPU and store allocator
@@ -200,18 +199,18 @@ public:
       : GraphGroup(options),
         multiNodeDevices_{options_->get<std::vector<int>>("multi-node-devices")},
         commOverlap_{options_->get<bool>("multi-node-overlap")},
-        maxNumberComputeIters_{options_->get<int>("multi-node-max-compute")},
+        maxNumberComputeItersPerSync_{options_->get<int>("multi-node-max-compute")},
         commOverlapSingleActive_{options_->get<bool>("multi-node-single-comm")},
         movingAvg_{options_->get<float>("exponential-smoothing") > 0},
         mvDecay_{options_->get<float>("exponential-smoothing")},
         tau_{options_->get<size_t>("optimizer-delay")} {
     initMPI();
     setupClientsOfNodesAndDevices();
-    gpuSummedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
-    gpuCommittedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
-    commBuffersFilled_ = std::vector<bool>(devices_.size(), false);
-    mutexCommBuffersFilled_ = std::vector<std::mutex>{devices_.size()};
-    cvCommBuffersFilled_ = std::vector<std::condition_variable>(devices_.size());
+    clientSummedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
+    clientCommittedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
+    clientCommOverlapBuffersFilled_ = std::vector<bool>(devices_.size(), false);
+    mutexClientCommOverlapBuffersFilled_ = std::vector<std::mutex>{devices_.size()};
+    cvClientCommOverlapBuffersFilled_ = std::vector<std::condition_variable>(devices_.size());
     numberComputeIters_ = std::vector<size_t>(devices_.size(), 0);
     mutexGpuShards_ = std::vector<std::mutex>(devices_.size());
     pool_ = new marian::ThreadPool(devices_.size(), devices_.size());
@@ -221,7 +220,7 @@ public:
       graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
       graphs_.push_back(graph);
       gpuShardsOpts_.push_back(Optimizer(options_));
-      localOpts_.push_back(Optimizer(options_)); // => for simple SGD opt: localOpts_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
+      clientLocalOpts_.push_back(Optimizer(options_)); // => for simple SGD opt: clientLocalOpts_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
       builders_.push_back(models::from_config(options_));
     }
   }
