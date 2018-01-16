@@ -216,7 +216,7 @@ void MultiNodeSparseGraphGroup::synchronizeWithServerShards(Tensor newGrads, Ten
       }
       endOffset++;
 
-      SparseTensorBase(localSparseDeltas_[gpu]->data() + nodeOffset, localSparseDeltas_[gpu]->indices() + nodeOffset, endOffset - nodeOffset, gpu).scatterAdd(oldParams->subtensor(offset, nodeSize), nodeShard * nodeShardSize);
+      SparseTensorBase(localSparseDeltas_[gpu]->data() + nodeOffset, localSparseDeltas_[gpu]->indices() + nodeOffset, endOffset - nodeOffset, devices_[gpu]).scatterAdd(oldParams->subtensor(offset, nodeSize), nodeShard * nodeShardSize);
       nodeOffset += endOffset;
     }
     cudaStreamSynchronize(0);
