@@ -164,7 +164,7 @@ void MultiNodeSparseGraphGroup::launchServerThread() {
   #endif
 }
 
-void MultiNodeSparseGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords, std::mutex *optionalBlockMutex) {
+void MultiNodeSparseGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
   #if MPI_FOUND
   size_t offset = 0;
   for (int node = 0; node < this->mpi_comm_world_size_; node++) {
@@ -182,8 +182,6 @@ void MultiNodeSparseGraphGroup::synchronizeWithServerShards(Tensor newGrads, Ten
 
     unsigned long messageInfo[4];
     {
-      std::unique_lock<std::mutex> uniqueAccess = (optionalBlockMutex == nullptr) ? std::unique_lock<std::mutex>() : std::unique_lock<std::mutex>(*optionalBlockMutex, std::try_to_lock); // Lock mutex if provided
-
       // Send sparse grads to node
       messageInfo[this->MSG_INFO_SIZE_] = std::min((size_t) sparseSubNewGrads->size(), nodeSize);
       messageInfo[this->MSG_INFO_CLIENT_] = gpu;

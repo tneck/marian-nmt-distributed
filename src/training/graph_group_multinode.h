@@ -39,16 +39,9 @@ protected:
 
   boost::shared_mutex schedulerMutex_;
 
-  std::vector<Tensor> paramsAvg_;
-  std::vector<Ptr<TensorAllocator>> paramsAllocAvg_;
-  bool movingAvg_{false};
-  float mvDecay_{1e-4};
-
   ThreadPool * pool_;
 
   std::vector<Ptr<TensorAllocator>> allocators_;
-
-  size_t tau_{1};
 
   size_t batchIter_ = 0; // For dividing batches amongst nodes
 
@@ -81,19 +74,12 @@ protected:
   std::vector<size_t> nodeShardSizes_; // Number of params allocated to each node
   std::vector<size_t> localSubShardSizes_; // Number of params allocated to shards on this node
 
-  std::vector<int> multiNodeDevices_; // Specifies the GPU configuration of all nodes (e.g. [2 0 1 1 0] = 2 GPUs on first node: devices 0 and 1, plus 1 GPU on second node: device 0)
-
   static const unsigned int MSG_INFO_SIZE_{0}, MSG_INFO_CLIENT_{1}, MSG_INFO_BATCHWORDS_{2}, MSG_INFO_STATUS_{3};
   static const unsigned int STATUS_NODE_TRAINING_{0}, STATUS_NODE_FINISHED_{1};
 
   // Computations/communication overlap variables
 
   bool commOverlap_; // Overlapping computation during communication
-  int maxNumberComputeItersPerSync_; // Max number of compute iterations that a node can do per synchronisation
-  std::vector<size_t> numberComputeIters_; // Current number of compute iterations of each client since last synchronisation
-
-  bool commOverlapSingleActive_; // Whether only one overlap thread can use communication channel at any time
-  std::mutex mutexCommChannel_; // Mutex to limit communication channel to one overlapping thread (if commOverlapSingleActive_ == true)
 
   std::vector<std::thread*> clientCommThreads_;
   bool stopClientCommThreads_{false};
@@ -139,7 +125,7 @@ protected:
   /**
    * @brief Get number of clients of every node by communicating with all nodes in cluster @TODO: Communication will not be necessary once run-time option is implemented
    */
-  void setupClientsOfNodesAndDevices();
+  void setupClientsOfNodesAndDevices(std::vector<int> multiNodeDevices);
 
   /**
    * @brief Initialize client buffers for remote communication (synchronisation)
@@ -160,7 +146,7 @@ protected:
    * @param batchWords Number of batch words to pass to server shard optimizers
    * @param optionalBlockMutex Optional mutex that has to be locked during synchronization
    */
-  virtual void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr);
+  virtual void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0);
 
   /**
    * @brief Launch independent threads which continually synchronize their client's gradients/parameters whenever the respective communication buffers are full
@@ -197,21 +183,14 @@ public:
    */
   MultiNodeGraphGroup(Ptr<Config> options)
       : GraphGroup(options),
-        multiNodeDevices_{options_->get<std::vector<int>>("multi-node-devices")},
-        commOverlap_{options_->get<bool>("multi-node-overlap")},
-        maxNumberComputeItersPerSync_{options_->get<int>("multi-node-max-compute")},
-        commOverlapSingleActive_{options_->get<bool>("multi-node-single-comm")},
-        movingAvg_{options_->get<float>("exponential-smoothing") > 0},
-        mvDecay_{options_->get<float>("exponential-smoothing")},
-        tau_{options_->get<size_t>("optimizer-delay")} {
+        commOverlap_{options_->get<bool>("multi-node-overlap")} {
     initMPI();
-    setupClientsOfNodesAndDevices();
+    setupClientsOfNodesAndDevices(options_->get<std::vector<int>>("multi-node-devices"));
     clientSummedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
     clientCommittedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
     clientCommOverlapBuffersFilled_ = std::vector<bool>(devices_.size(), false);
     mutexClientCommOverlapBuffersFilled_ = std::vector<std::mutex>{devices_.size()};
     cvClientCommOverlapBuffersFilled_ = std::vector<std::condition_variable>(devices_.size());
-    numberComputeIters_ = std::vector<size_t>(devices_.size(), 0);
     mutexGpuShards_ = std::vector<std::mutex>(devices_.size());
     pool_ = new marian::ThreadPool(devices_.size(), devices_.size());
     for(auto device : devices_) {

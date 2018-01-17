@@ -80,7 +80,7 @@ private:
    * @param batchWords Number of batch words to pass to server shard optimizers
    * @param optionalBlockMutex Optional mutex that has to be locked during synchronization
    */
-  virtual void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0, std::mutex * optionalBlockMutex = nullptr);
+  virtual void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0);
 
 
   /**
