@@ -66,7 +66,7 @@ void MultiNodeSparseGraphGroup::setupClientSizesOfNodes() {
       s += " " + std::to_string(size);
       s += client == this->numberClientsOfNodes_[node] - 1 ? "" : ", ";
     }
-    //if (this->mpi_my_rank_ == 0) { LOG(info)->info(s); } // If node 0, print parameter sharding layout
+    if (this->mpi_my_rank_ == 0) { LOG(info, s); } // If node 0, print parameter sharding layout
   }
 }
 

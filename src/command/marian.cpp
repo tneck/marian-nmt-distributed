@@ -50,15 +50,13 @@ int main(int argc, char** argv) {
 }
 
 bool configureMPI(int argc, char** argv) {
-  int comm_world_size = 0;
   int provided_thread_mode = 0;
   #if MPI_FOUND
   MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_mode);
   MPI_Comm_set_errhandler(MPI_COMM_WORLD, MPI_ERRORS_RETURN); // Enable if occasional truncation errors
-  MPI_Comm_size(MPI_COMM_WORLD, &comm_world_size);
-  ABORT_IF(provided_thread_mode < MPI_THREAD_MULTIPLE, "Your version of MPI does not support multiple threads.");
+  ABORT_IF(provided_thread_mode < MPI_THREAD_MULTIPLE, "Your version of MPI does not support multi-threaded communication.");
   #endif
-  return comm_world_size > 1;
+  return true;
 }
 
 void terminateMPI() {
