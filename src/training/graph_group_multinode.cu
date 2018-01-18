@@ -293,7 +293,9 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
 
     cudaStreamSynchronize(0);
 
-    synchronizeWithServerShards(graph->params()->grads(), graph->params()->vals(), my_id, batch->words());
+    if(!commOverlap_) {
+      synchronizeWithServerShards(graph->params()->grads(), graph->params()->vals(), my_id, batch->words());
+    }
 
     if (scheduler_) {
       boost::upgrade_lock<boost::shared_mutex> lock(schedulerMutex_);
