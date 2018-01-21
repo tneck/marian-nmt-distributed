@@ -9,11 +9,14 @@ void MultiNodeGraphGroup::setScheduler(Ptr<Scheduler> scheduler) {
   // optimizer has to be registered last to see a change of learning rate
   scheduler_->registerTrainingObserver(scheduler_);
 
-  for (auto opt : gpuShardsOpts_) {
+  for (auto opt : shardOptimizers_) {
     scheduler_->registerTrainingObserver(opt);
   }
 }
 
+/**
+ * Allocate new tensor on given GPU and store allocator.
+ */
 Tensor MultiNodeGraphGroup::newTensor(int size, int device) {
   Tensor t;
   Ptr<TensorAllocator> allocator = New<TensorAllocator>(device);
@@ -23,107 +26,167 @@ Tensor MultiNodeGraphGroup::newTensor(int size, int device) {
   return t;
 }
 
-void MultiNodeGraphGroup::initFirstRun(Ptr<data::Batch> batch) {
-  // Initialize client graphs (incl. params) and builders
-  for (size_t i = 0; i < graphs_.size(); ++i) {
-    THREAD_GUARD(
-        builders_[i]->build(graphs_[i], batch);
-        graphs_[i]->forward();
-    );
-  }
-  cudaStreamSynchronize(0);
-  // Initialize variables for server shard(s) on this node
-  initServerShards();
-  // Initialize client variables for inter-node communication
-  initClientCommunicationVars();
-  // Launch server thread to communicate with clients
-  launchServerThread();
-  // Launch compute/communicate overlap threads if enabled
+/**
+   * Setup training environment and launch server thread and (if enabled) client communication overlap threads..
+   * Includes setting up MPI, node and shard sizes, clients, server shards and communication overlap stuff.
+   */
+void MultiNodeGraphGroup::init(Ptr<data::Batch> batch) {
+  // Setup clients and shards
+  setupMPI();
+  setupClients(options_->get<std::vector<int>>("multi-node-devices"), batch);
+  setupServerShards();
   if (commOverlap_) {
-    launchCommOverlapThreads();
+    initClientCommOverlapVars();
+    initClientCommOverlapGpuTensors();
+  }
+  // Launch threads
+  launchServerThread(); // For receiving and processing gradients and sending back parameters
+  if (commOverlap_) {
+    launchCommOverlapThreads(); // For communicating with server shards while other threads do computations
   }
 }
 
-void MultiNodeGraphGroup::initMPI() {
+/**
+ * Setup MPI world size and rank of this node.
+ */
+void MultiNodeGraphGroup::setupMPI() {
 #if MPI_FOUND
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_comm_world_size_);
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_my_rank_);
 #endif
 }
 
-void MultiNodeGraphGroup::initServerShards(bool initFullSendReceiveBuffer) {
-  // Initialize server shard sizes for all nodes (remote + current)
-  size_t totalParamsGradsSize = graphs_[0]->params()->vals()->size();
-  size_t nodeShardSize = ceilf(((float) totalParamsGradsSize) / mpi_comm_world_size_);
-  size_t remainingTotalSize = totalParamsGradsSize;
+/**
+ * Setup clients that will compute gradients and communicate them with the server shards.
+ * There is one client per GPU.
+ */
+void MultiNodeGraphGroup::setupClients(std::vector<int> deviceConfig, Ptr<data::Batch> batch) {
+  runBatchThroughClientGraphs(batch);
+  calculateNodeSizes();
+  initClientCpuBuffers();
+  if(commOverlap_) {
+    initClientCommOverlapVars();
+    initClientCommOverlapGpuTensors();
+  }
+  pool_ = new marian::ThreadPool(devices_.size(), devices_.size());
+}
+
+/**
+ * Initialize the graphs (models) of all clients on this node with the given batch.
+ */
+void MultiNodeGraphGroup::runBatchThroughClientGraphs(Ptr<data::Batch> batch) {
+  for(int i = 0; i < devices_.size(); i++) {
+    THREAD_GUARD(
+        clientBuilders_[i]->build(clientGraphs_[i], batch);
+        clientGraphs_[i]->forward();
+    );
+  }
+  cudaStreamSynchronize(0);
+}
+
+/**
+ * Calculate the size of each node in the MPI world (cluster).
+ * Account for the edge case where the last node has fewer parameters because the model size is not perfectly divisible by the number of nodes.
+ */
+void MultiNodeGraphGroup::calculateNodeSizes() {
+  size_t modelSize = clientGraphs_[0]->params()->vals()->size();
+  size_t nodeSize = ceilf(((float) modelSize) / mpi_comm_world_size_);
   for (int node = 0; node < mpi_comm_world_size_; node++) {
-    size_t size = std::min(nodeShardSize, remainingTotalSize);
-    nodeShardSizes_.push_back(size);
-    remainingTotalSize -= size;
+    size_t remainingModelSize = modelSize - (nodeSize * node);
+    nodeSizes_.push_back(std::min(nodeSize, remainingModelSize)); // Takes care of edge case where last node is smaller than the others
   }
+}
 
-  // Initialize this shard's params and grads
-  size_t thisNodeSize = nodeShardSizes_[mpi_my_rank_];
-  size_t gpuShardSize = ceilf(((float) thisNodeSize) / devices_.size());
+/**
+ * Initialize a CPU buffer for each client on this node for storing gradients or parameters.
+ * Required for sending GPU data through MPI to other nodes (GPU -> CPU -> MPI network).
+ */
+void MultiNodeGraphGroup::initClientCpuBuffers() {
+  // Initialize CPU buffers used to send GPU data through MPI (can't send directly from GPUs)
+  for (int i = 0; i < devices_.size(); i++) {
+    size_t size = nodeSizes_[mpi_my_rank_]; // @TODO Optimization: Use full size to copy in one go, then send gradients and receive parameters in parallel
+    clientCommBuffersCPU_.push_back(std::vector<float>(size));
+  }
+}
+
+/**
+ * Initialize variables required for overlapping client computations and communication.
+ * Includes summed and committed word counts, buffer flags, mutexes and condition variables.
+ */
+void MultiNodeGraphGroup::initClientCommOverlapVars() {
+  clientSummedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
+  clientCommittedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
+  clientCommOverlapBuffersFilled_ = std::vector<bool>(devices_.size(), false);
+  mutexClientCommOverlapBuffersFilled_ = std::vector<std::mutex>{devices_.size()};
+  cvClientCommOverlapBuffersFilled_ = std::vector<std::condition_variable>(devices_.size());
+}
+
+/**
+ * Initialize GPU tensors required for overlapping client computations and communication.
+ * Includes secondary buffers for params/grads, buffers for locally summing gradients, and local optimizers to apply received gradients to client parameters.
+ */
+void MultiNodeGraphGroup::initClientCommOverlapGpuTensors() {
+  size_t modelSize = clientGraphs_[0]->params()->vals()->size();
+  for (int client = 0; client < devices_.size(); client++) {
+    // Communication overlap buffer (for grads + params)
+    Tensor commOverlapBuffer = newTensor(modelSize, devices_[client]);
+    commOverlapBuffer->copyFrom(clientGraphs_[0]->params()->vals());
+    clientCommOverlapBuffersGPU_.push_back(commOverlapBuffer );
+    // Gradients local sum buffer
+    Tensor sumGrads = newTensor(modelSize, devices_[client]);
+    sumGrads->set(0);
+    clientSummedGradsGPU.push_back(sumGrads);
+    // Local optimizer to apply summed gradients
+    clientLocalOptimizers_.push_back(Optimizer(options_)); // => for simple SGD opt: clientLocalOptimizers_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
+  }
+}
+
+/**
+ * Setup server shards that will receive gradients from clients, apply them to their part of the global parameters, and send them back to the same clients.
+ * There is one server shard per GPU. (Each GPU acts both as a client and as a server shard.)
+ */
+void MultiNodeGraphGroup::setupServerShards() {
+  calculateShardSizes();
+  initShardGpuTensors();
+  // CPU buffer for receiving/sending grads/params
+  serverShardBufferCPU_ = std::vector<float>(nodeSizes_[mpi_my_rank_]);
+  // Shard optimizers
+  for (int shard = 0; shard < devices_.size(); shard++) {
+    shardOptimizers_.push_back(Optimizer(options_));
+  }
+  // Mutexes to prevent simultaneous access to tensors and/or optimizers
+  mutexShards_ = std::vector<std::mutex>(devices_.size());
+}
+
+/**
+ * Calculate the size of each shard on this node.
+ * Account for the edge case where the last shard has fewer parameters because the node size is not perfectly divisibly by the number of shards.
+ */
+void MultiNodeGraphGroup::calculateShardSizes() {
+  size_t nodeSize = nodeSizes_[mpi_my_rank_];
+  size_t shardSize = ceilf(((float) nodeSize) / devices_.size());
+  for (int shard = 0; shard < devices_.size(); shard++) {
+    size_t remainingNodeSize = nodeSize - (shardSize * shard);
+    shardSizes_.push_back(std::min(shardSize, remainingNodeSize)); // Takes care of edge case where last shard is smaller than the others
+  }
+}
+
+/**
+ * Initialize the GPU tensors for storing the parameters and gradients of each server shard.
+ */
+void MultiNodeGraphGroup::initShardGpuTensors() {
   size_t offset = 0;
-
-  for (int gpu = 0; gpu < devices_.size(); gpu++) {
-    size_t size = std::min(gpuShardSize, thisNodeSize - offset);
-    Tensor gpuParams = newTensor(size, devices_[gpu]);
-    gpuParams->copyFrom(graphs_[0]->params()->vals()->subtensor(offset, size));
-    gpuShardsParams_.push_back(gpuParams);
-    gpuShardsGrads_.push_back(newTensor(size, devices_[gpu]));
-    localSubShardSizes_.push_back(size);
-    offset += size;
-  }
-
-  // Initialize full send/receive buffer
-  if (initFullSendReceiveBuffer) {
-    serverShardBuffer_ = std::vector<float>(nodeShardSizes_[mpi_my_rank_]);
+  for (int shard = 0; shard < devices_.size(); shard++) {
+    Tensor gpuParams = newTensor(shardSizes_[shard], devices_[shard]);
+    gpuParams->copyFrom(clientGraphs_[0]->params()->vals()->subtensor(offset, shardSizes_[shard]));
+    shardParams_.push_back(gpuParams);
+    shardGrads_.push_back(newTensor(shardSizes_[shard], devices_[shard]));
   }
 }
 
-void MultiNodeGraphGroup::setupClientsOfNodesAndDevices(std::vector<int> multiNodeDevices) {
-  int index = 0, node = 0, nClientsSeen = 0;
-  numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_, 0);
-  while (index < multiNodeDevices.size()) {
-    if (numberClientsOfNodes_[node] == 0) {
-      numberClientsOfNodes_[node] = (size_t) multiNodeDevices[index];
-      nClientsSeen = 0;
-    } else if (nClientsSeen < numberClientsOfNodes_[node]) {
-      if (node == mpi_my_rank_) {
-        devices_.push_back((size_t)multiNodeDevices[index]);
-      }
-      nClientsSeen++;
-    } else {
-      node++;
-      index--;
-    }
-    index++;
-  }
-}
-
-void MultiNodeGraphGroup::initClientCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
-  for (int gpu = 0; gpu < devices_.size(); gpu++) {
-    if (initBuffers) {
-      size_t size = nodeShardSizes_[mpi_my_rank_];
-      clientCommBuffersCPU_.push_back(std::vector<float>(size));
-    }
-    if (commOverlap_) {
-      size_t fullSize = graphs_[0]->params()->vals()->size();
-      // Running sum of gradients
-      Tensor sumGrads = newTensor(fullSize, devices_[gpu]);
-      Element(functional::_1 = 0, sumGrads);
-      cudaStreamSynchronize(0);
-      clientSummedGradsGPU.push_back(sumGrads);
-      // Communication overlap buffer (for grads + params)
-      Tensor commBuffer = newTensor(fullSize, devices_[gpu]);
-      commBuffer->copyFrom(graphs_[0]->params()->vals());
-      clientCommOverlapBuffersGPU_.push_back(commBuffer);
-    }
-  }
-}
-
+/**
+ * Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters.
+ */
 void MultiNodeGraphGroup::launchServerThread() {
 #if MPI_FOUND
   serverShardThread_ = new std::thread([this] {
@@ -137,30 +200,30 @@ void MultiNodeGraphGroup::launchServerThread() {
         nCommunicatingNodes--;
         continue;
       } // register finished node and skip to next loop iteration
-      MPI_Recv(serverShardBuffer_.data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(serverShardBufferCPU_.data(), nodeSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
       // Update shard params asynchronously over GPUs
       std::vector<std::thread> threads;
       size_t offset = 0;
       for (int gpu = 0; gpu < devices_.size(); gpu++) {
-        size_t size = localSubShardSizes_[gpu];
+        size_t size = shardSizes_[gpu];
 
         threads.emplace_back(std::thread([=](int gpu, size_t offset, size_t size, size_t batchWords) {
-          std::lock_guard<std::mutex> guard(mutexGpuShards_[gpu]);
+          std::lock_guard<std::mutex> guard(mutexShards_[gpu]);
 
           // Copy grads to appropriate GPU
-          cudaMemcpy(gpuShardsGrads_[gpu]->data(), &serverShardBuffer_.at(offset), size * sizeof(float), cudaMemcpyHostToDevice);
+          cudaMemcpy(shardGrads_[gpu]->data(), &serverShardBufferCPU_.at(offset), size * sizeof(float), cudaMemcpyHostToDevice);
           cudaStreamSynchronize(0);
 
           // Run optimizer on GPU
           if (scaleLearningRate_ && batchWords > 0) {
-            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords / avgBatchWords_);
+            shardOptimizers_[gpu]->update(shardParams_[gpu], shardGrads_[gpu], batchWords / avgBatchWords_);
           } else {
-            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
+            shardOptimizers_[gpu]->update(shardParams_[gpu], shardGrads_[gpu]);
           }
           cudaStreamSynchronize(0);
           // Copy params from GPU
-          cudaMemcpy(&serverShardBuffer_.at(offset), gpuShardsParams_[gpu]->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
+          cudaMemcpy(&serverShardBufferCPU_.at(offset), shardParams_[gpu]->data(), size * sizeof(float), cudaMemcpyDeviceToHost);
           cudaStreamSynchronize(0);
         }, gpu, offset, size, messageInfo[MSG_INFO_BATCHWORDS_]));
 
@@ -169,7 +232,7 @@ void MultiNodeGraphGroup::launchServerThread() {
       for (auto &&t : threads) { t.join(); }
 
       // Send updated params to same client
-      MPI_Ssend(serverShardBuffer_.data(), nodeShardSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE,
+      MPI_Ssend(serverShardBufferCPU_.data(), nodeSizes_[mpi_my_rank_], MPI_FLOAT, status.MPI_SOURCE,
                 MPI_TAG_PARAM_PUSH_, MPI_COMM_WORLD);
 
     } while (nCommunicatingNodes != 0);
@@ -177,11 +240,66 @@ void MultiNodeGraphGroup::launchServerThread() {
 #endif
 }
 
+/**
+ * Safely shut down the launched server shard thread.
+ */
+void MultiNodeGraphGroup::shutDownServerThread() {
+  serverShardThread_->join(); // Wait for server thread to finish communicating (with unfinished nodes)
+}
+
+/**
+ * Launch independent threads which continually synchronize their client's gradients/parameters whenever the respective communication buffers are full.
+ */
+void MultiNodeGraphGroup::launchCommOverlapThreads() {
+#if MPI_FOUND
+  for (int gpu = 0; gpu < devices_.size(); gpu++) {
+    clientCommThreads_.emplace_back(new std::thread([this](int gpu) {
+      do {
+        // Wait for GPU (client) to fill buffers pointers
+        std::unique_lock<std::mutex> uniqueLock(mutexClientCommOverlapBuffersFilled_[gpu]);
+        while (!clientCommOverlapBuffersFilled_[gpu]) {
+          cvClientCommOverlapBuffersFilled_[gpu].wait(uniqueLock);
+        }
+
+        if (stopClientCommThreads_) { break; }
+
+        // Synchronize with server shards
+        synchronizeWithServerShards(clientCommOverlapBuffersGPU_[gpu], clientCommOverlapBuffersGPU_[gpu], gpu, scaleLearningRate_ ? clientCommittedWordCounts_[gpu] : 0);
+
+        // Indicate that buffers can be read from and filled again
+        clientCommOverlapBuffersFilled_[gpu] = false;
+
+      } while (!stopClientCommThreads_);
+    }, gpu));
+  }
+#endif
+}
+
+/**
+ * Safely shut down the launched communication overlap threads
+ */
+void MultiNodeGraphGroup::shutDownCommOverlapThreads() {
+  stopClientCommThreads_ = true;
+  for (int gpu = 0; gpu < devices_.size(); gpu++) {
+    clientCommOverlapBuffersFilled_[gpu] = true;
+    cvClientCommOverlapBuffersFilled_[gpu].notify_one(); // Unblock thread from lock, then join it
+    clientCommThreads_[gpu]->join();
+  }
+}
+
+/**
+ * Send new gradients to the server shards and receive the updated (global) parameters.
+ *
+ * @param newGrads Gradients to send
+ * @param oldParams Parameters to replace
+ * @param gpu GPU/client performing synchronize (to access appropriate buffers etc.)
+ * @param batchWords Number of batch words to pass to server shard optimizers
+ */
 void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
   #if MPI_FOUND
   size_t offset = 0;
   for (int node = 0; node < mpi_comm_world_size_; node++) {
-    size_t nodeSize = nodeShardSizes_[node];
+    size_t nodeSize = nodeSizes_[node];
 
     // Update remotely if node != this node
     if (node != mpi_my_rank_) {
@@ -213,22 +331,22 @@ void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor ol
       std::vector<std::thread> threads;
 
       for (int gpu = 0; gpu < devices_.size(); gpu++) {
-        size_t gpuSize = localSubShardSizes_[gpu];
+        size_t gpuSize = shardSizes_[gpu];
 
         threads.emplace_back(std::thread([=](int gpu, size_t offset, size_t size) {
-          std::lock_guard<std::mutex> guard(mutexGpuShards_[gpu]);
+          std::lock_guard<std::mutex> guard(mutexShards_[gpu]);
 
           // Copy grads to appropriate GPU
-          gpuShardsGrads_[gpu]->copyFrom(newGrads->subtensor(offset, size));
+          shardGrads_[gpu]->copyFrom(newGrads->subtensor(offset, size));
           // Run optimizer on GPU
           if (scaleLearningRate_ && batchWords > 0) {
-            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu], batchWords / avgBatchWords_);
+            shardOptimizers_[gpu]->update(shardParams_[gpu], shardGrads_[gpu], batchWords / avgBatchWords_);
           } else {
-            gpuShardsOpts_[gpu]->update(gpuShardsParams_[gpu], gpuShardsGrads_[gpu]);
+            shardOptimizers_[gpu]->update(shardParams_[gpu], shardGrads_[gpu]);
           }
           cudaStreamSynchronize(0);
           // Copy params back to current GPU
-          oldParams->subtensor(offset, size)->copyFrom(gpuShardsParams_[gpu]);
+          oldParams->subtensor(offset, size)->copyFrom(shardParams_[gpu]);
         }, gpu, localOffset, gpuSize));
 
         localOffset += gpuSize;
@@ -241,35 +359,16 @@ void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor ol
   #endif
 }
 
-void MultiNodeGraphGroup::launchCommOverlapThreads() {
-#if MPI_FOUND
-  for (int gpu = 0; gpu < devices_.size(); gpu++) {
-    clientCommThreads_.emplace_back(new std::thread([this](int gpu) {
-      do {
-        // Wait for GPU (client) to fill buffers pointers
-        std::unique_lock<std::mutex> uniqueLock(mutexClientCommOverlapBuffersFilled_[gpu]);
-        while (!clientCommOverlapBuffersFilled_[gpu]) {
-          cvClientCommOverlapBuffersFilled_[gpu].wait(uniqueLock);
-        }
-
-        if (stopClientCommThreads_) { break; }
-
-        // Synchronize with server shards
-        synchronizeWithServerShards(clientCommOverlapBuffersGPU_[gpu], clientCommOverlapBuffersGPU_[gpu], gpu, scaleLearningRate_ ? clientCommittedWordCounts_[gpu] : 0);
-
-        // Indicate that buffers can be read from and filled again
-        clientCommOverlapBuffersFilled_[gpu] = false;
-
-      } while (!stopClientCommThreads_);
-    }, gpu));
-  }
-#endif
-}
-
+/**
+ * Execute given batch on this node, pushing/pulling the resulting gradients/parameters to/from the server shards
+ * or -- if comm. overlap enabled -- to/from the communication buffers, summing gradients locally if the communication thread is busy
+ *
+ * @param batch Batch on which to perform forward and backward passes.
+ */
 void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
-  if (!firstBatchProcessed_) {
-    initFirstRun(batch);
-    firstBatchProcessed_ = true;
+  if (!initialized_) {
+    init(batch);
+    initialized_ = true;
   }
 
   auto task = [this](Ptr<data::Batch> batch) {
@@ -281,8 +380,8 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
     if (!graph) {
       std::lock_guard<std::mutex> lock(mutexClientInit_);
       my_id = i;
-      graph = graphs_[i];
-      builder = builders_[i++];
+      graph = clientGraphs_[i];
+      builder = clientBuilders_[i++];
     }
 
     auto costNode = builder->build(graph, batch);
@@ -315,7 +414,7 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
         boost::upgrade_to_unique_lock<boost::shared_mutex> uniqueLock(lock);
         //if(movingAvg_)
         //  fetchParams(graph->params()->vals(), paramsAvg_);
-        scheduler_->validate(graphs_);
+        scheduler_->validate(clientGraphs_);
       }
     }
 
@@ -347,7 +446,7 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
           clientCommOverlapBuffersFilled_[my_id] = true;
           cvClientCommOverlapBuffersFilled_[my_id].notify_one();
           // Apply summed gradients to new parameters
-          clientLocalOpts_[my_id]->update(graph->params()->vals(), clientSummedGradsGPU[my_id]);
+          clientLocalOptimizers_[my_id]->update(graph->params()->vals(), clientSummedGradsGPU[my_id]);
           // Clear summed gradients
           clientSummedGradsGPU[my_id]->set(0);
         }
@@ -361,6 +460,9 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
   pool_->enqueue(task, batch);
 }
 
+/**
+ * Notify server shards that this node has finished training.
+ */
 void MultiNodeGraphGroup::signalFinishedToServerShards() {
   #if MPI_FOUND
   unsigned long messageInfo[4];
@@ -369,19 +471,6 @@ void MultiNodeGraphGroup::signalFinishedToServerShards() {
     MPI_Ssend(&messageInfo, 4, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
   }
   #endif
-}
-
-void MultiNodeGraphGroup::shutDownServerShardThread() {
-  serverShardThread_->join(); // Wait for server thread to finish communicating (with unfinished nodes)
-}
-
-void MultiNodeGraphGroup::shutDownCommOverlapThreads() {
-  stopClientCommThreads_ = true;
-  for (int gpu = 0; gpu < devices_.size(); gpu++) {
-    clientCommOverlapBuffersFilled_[gpu] = true;
-    cvClientCommOverlapBuffersFilled_[gpu].notify_one(); // Unblock thread from lock, then join it
-    clientCommThreads_[gpu]->join();
-  }
 }
 
 }

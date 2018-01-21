@@ -27,10 +27,10 @@ protected:
 
   // Variables inherited from AsyncGraphGroup
 
-  bool firstBatchProcessed_{false};
+  bool initialized_{false};
 
-  std::vector<Ptr<models::ModelBase>> builders_;
-  std::vector<Ptr<ExpressionGraph>> graphs_;
+  std::vector<Ptr<models::ModelBase>> clientBuilders_;
+  std::vector<Ptr<ExpressionGraph>> clientGraphs_;
   std::vector<size_t> devices_;
 
   Ptr<Scheduler> scheduler_;
@@ -57,13 +57,13 @@ protected:
 
   std::thread * serverShardThread_;
 
-  std::vector<float> serverShardBuffer_;
+  std::vector<float> serverShardBufferCPU_;
 
-  std::vector<Ptr<OptimizerBase>> gpuShardsOpts_;
-  std::vector<Tensor> gpuShardsParams_;
-  std::vector<Tensor> gpuShardsGrads_;
+  std::vector<Ptr<OptimizerBase>> shardOptimizers_;
+  std::vector<Tensor> shardParams_;
+  std::vector<Tensor> shardGrads_;
 
-  std::vector<std::mutex> mutexGpuShards_;
+  std::vector<std::mutex> mutexShards_;
 
   // Client communication variables
 
@@ -71,8 +71,8 @@ protected:
 
   std::vector<int> numberClientsOfNodes_;
 
-  std::vector<size_t> nodeShardSizes_; // Number of params allocated to each node
-  std::vector<size_t> localSubShardSizes_; // Number of params allocated to shards on this node
+  std::vector<size_t> nodeSizes_; // Number of params allocated to nodes in comm world
+  std::vector<size_t> shardSizes_; // Number of params allocated to shards on this node
 
   static const unsigned int MSG_INFO_SIZE_{0}, MSG_INFO_CLIENT_{1}, MSG_INFO_BATCHWORDS_{2}, MSG_INFO_STATUS_{3};
   static const unsigned int STATUS_NODE_TRAINING_{0}, STATUS_NODE_FINISHED_{1};
@@ -87,7 +87,7 @@ protected:
   std::vector<Tensor> clientSummedGradsGPU;
   std::vector<size_t> clientSummedWordCounts_;
   std::vector<size_t> clientCommittedWordCounts_;
-  std::vector<Ptr<OptimizerBase>> clientLocalOpts_;
+  std::vector<Ptr<OptimizerBase>> clientLocalOptimizers_;
 
   std::vector<Tensor> clientCommOverlapBuffersGPU_;
 
@@ -96,130 +96,173 @@ protected:
   std::vector<std::condition_variable> cvClientCommOverlapBuffersFilled_;
 
   /**
-   * @brief Allocate new tensor on given GPU and store allocator
-   *
-   * @param size Number of floats to allocate
-   * @param device GPU
-   * @return Allocated tensor
+   * Allocate new tensor on given GPU and store allocator.
    */
   Tensor newTensor(int size, int device);
 
   /**
-   * @brief Initialize graphs and variables for MPI, remote communicator, server shard,
-   * and overlapping compute/communicate, and launch server and client communication threads
-   *
-   * @param batch Batch to build initial graph with
+   * Setup training environment and launch server thread and (if enabled) client communication overlap threads..
+   * Includes setting up MPI, node and shard sizes, clients, server shards and communication overlap stuff.
    */
-  virtual void initFirstRun(Ptr<data::Batch> batch);
+  virtual void init(Ptr<data::Batch> batch);
 
   /**
-   * @brief Initialize variables relevant to MPI, i.e. size of cluster and rank of this node
+   * Setup MPI world size and rank of this node.
    */
-  void initMPI();
+  void setupMPI();
 
   /**
-   * @brief Initialize server shard, i.e. sizes, parameters, gradients and buffers
+   * Setup clients that will compute gradients and communicate them with the server shards.
+   * There is one client per GPU.
    */
-  virtual void initServerShards(bool initFullSendReceiveBuffer = true);
+  void setupClients(std::vector<int> deviceConfig, Ptr<data::Batch> batch);
 
   /**
-   * @brief Get number of clients of every node by communicating with all nodes in cluster @TODO: Communication will not be necessary once run-time option is implemented
+   * Initialize the graphs (models) of all clients on this node with the given batch.
    */
-  void setupClientsOfNodesAndDevices(std::vector<int> multiNodeDevices);
+  void runBatchThroughClientGraphs(Ptr<data::Batch> batch);
 
   /**
-   * @brief Initialize client buffers for remote communication (synchronisation)
+   * Calculate the size of each node in the MPI world (cluster).
+   * Account for the edge case where the last node has fewer parameters because the model size is not perfectly divisible by the number of nodes.
    */
-  virtual void initClientCommunicationVars(bool initBuffers = true);
+  void calculateNodeSizes();
 
-  /*
-   * @brief Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters
+  /**
+   * Initialize a CPU buffer for each client on this node for storing gradients or parameters.
+   * Required for sending GPU data through MPI to other nodes (GPU -> CPU -> MPI network).
+   */
+  void initClientCpuBuffers();
+
+  /**
+   * Initialize variables required for overlapping client computations and communication.
+   * Includes summed and committed word counts, buffer flags, mutexes and condition variables.
+   */
+  void initClientCommOverlapVars();
+
+  /**
+   * Initialize GPU tensors required for overlapping client computations and communication.
+   * Includes secondary buffers for params/grads, buffers for locally summing gradients, and local optimizers to apply received gradients to client parameters.
+   */
+  void initClientCommOverlapGpuTensors();
+
+  /**
+   * Setup server shards that will receive gradients from clients, apply them to their part of the global parameters, and send them back to the same clients.
+   * There is one server shard per GPU. (Each GPU acts both as a client and as a server shard.)
+   */
+  void setupServerShards();
+
+  /**
+   * Calculate the size of each shard on this node.
+   * Account for the edge case where the last shard has fewer parameters because the node size is not perfectly divisibly by the number of shards.
+   */
+  void calculateShardSizes();
+
+  /**
+   * Initialize the GPU tensors for storing the parameters and gradients of each server shard.
+   */
+  void initShardGpuTensors();
+
+  /**
+   * Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters.
    */
   virtual void launchServerThread();
 
   /**
-   * @brief Send new gradients to the server shards and receive the updated (global) parameters
+   * Safely shut down the launched server shard thread.
+   */
+  void shutDownServerThread();
+
+  /**
+   * Launch independent threads which continually synchronize their client's gradients/parameters whenever the respective communication buffers are full.
+   */
+  void launchCommOverlapThreads();
+
+  /**
+   * Safely shut down the launched communication overlap threads
+   */
+  void shutDownCommOverlapThreads();
+
+  /**
+   * Send new gradients to the server shards and receive the updated (global) parameters.
    *
    * @param newGrads Gradients to send
    * @param oldParams Parameters to replace
    * @param gpu GPU/client performing synchronize (to access appropriate buffers etc.)
    * @param batchWords Number of batch words to pass to server shard optimizers
-   * @param optionalBlockMutex Optional mutex that has to be locked during synchronization
    */
   virtual void synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords = 0);
 
   /**
-   * @brief Launch independent threads which continually synchronize their client's gradients/parameters whenever the respective communication buffers are full
-   */
-  void launchCommOverlapThreads();
-
-  /**
-   * @brief Execute given batch on this node, pushing/pulling the resulting gradients/parameters to/from the server shards
+   * Execute given batch on this node, pushing/pulling the resulting gradients/parameters to/from the server shards
    * or -- if comm. overlap enabled -- to/from the communication buffers, summing gradients locally if the communication thread is busy
    *
-   * @param batch Batch on which to perform forward and backward passes
+   * @param batch Batch on which to perform forward and backward passes.
    */
   void execute(Ptr<data::Batch> batch);
 
   /**
-   * @brief Notify server shards that this node has finished training
+   * Notify server shards that this node has finished training.
    */
   virtual void signalFinishedToServerShards();
 
   /**
-   * @brief Safely shut down the launched server shard thread
+   * Load the GPU configuration of this node (i.e. which GPUs to use) and the number of GPUs on the other nodes.
    */
-  void shutDownServerShardThread();
-
-  /**
-   * @brief Safely shut down the launched communication overlap threads
-   */
-  void shutDownCommOverlapThreads();
+  void loadDeviceConfig(std::vector<int> deviceConfig) {
+    int index = 0, node = 0, nClientsSeen = 0;
+    numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_, 0);
+    while (index < deviceConfig.size()) {
+      if (numberClientsOfNodes_[node] == 0) {
+        numberClientsOfNodes_[node] = (size_t) deviceConfig[index];
+        nClientsSeen = 0;
+      }
+      else if (nClientsSeen < numberClientsOfNodes_[node]) {
+        if (node == mpi_my_rank_) {
+          devices_.push_back((size_t)deviceConfig[index]);
+        }
+        nClientsSeen++;
+      } else {
+        node++;
+        index--;
+      }
+      index++;
+    }
+  }
 
 public:
 
   /**
-   * @brief (Constructor) Configure settings and initialize graphs, shard optimizers, local optimizers, graph builders, etc. and their associated variables
+   * (Constructor) Call super class and initialize client graphs and builders.
    */
   MultiNodeGraphGroup(Ptr<Config> options)
       : GraphGroup(options),
         commOverlap_{options_->get<bool>("multi-node-overlap")} {
-    initMPI();
-    setupClientsOfNodesAndDevices(options_->get<std::vector<int>>("multi-node-devices"));
-    clientSummedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
-    clientCommittedWordCounts_ = std::vector<size_t>(devices_.size(), 0);
-    clientCommOverlapBuffersFilled_ = std::vector<bool>(devices_.size(), false);
-    mutexClientCommOverlapBuffersFilled_ = std::vector<std::mutex>{devices_.size()};
-    cvClientCommOverlapBuffersFilled_ = std::vector<std::condition_variable>(devices_.size());
-    mutexGpuShards_ = std::vector<std::mutex>(devices_.size());
-    pool_ = new marian::ThreadPool(devices_.size(), devices_.size());
-    for(auto device : devices_) {
-      auto graph = New<ExpressionGraph>();
-      graph->setDevice(device);
-      graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
-      graphs_.push_back(graph);
-      gpuShardsOpts_.push_back(Optimizer(options_));
-      clientLocalOpts_.push_back(Optimizer(options_)); // => for simple SGD opt: clientLocalOpts_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
-      builders_.push_back(models::from_config(options_));
+    // Set up devices for this node
+    loadDeviceConfig(options_->get<std::vector<int>>("multi-node-devices"));
+    // Create builders and graphs for clients.
+    for(int i = 0; i < devices_.size(); i++) {
+      clientGraphs_.push_back(New<ExpressionGraph>());
+      clientGraphs_[i]->setDevice(devices_[i]);
+      clientGraphs_[i]->reserveWorkspaceMB(options_->get<size_t>("workspace"));
+      clientBuilders_.push_back(models::from_config(options_));
     }
   }
 
   /**
-   * @brief (Destructor) Shut down server shard thread and (if comm. overlap enabled) communication overlap threads
+   * (Destructor) Shut down server shard thread and (if comm. overlap enabled) communication overlap threads
    */
   virtual ~MultiNodeGraphGroup() {
-    if (firstBatchProcessed_) {
+    if (initialized_) {
       if (commOverlap_) { shutDownCommOverlapThreads(); }
       signalFinishedToServerShards(); // notify other nodes that this node has finished training
-      shutDownServerShardThread();
+      shutDownServerThread();
     }
     delete pool_;
   }
 
   /**
-   * @brief Update any client model with given batch if batch is assigned to this node
-   *
-   * @param batch Batch to use in update
+   * Update any client model with given batch if batch is assigned to this node.
    */
   void update(Ptr<data::Batch> batch) {
     if (batchIter_ % mpi_comm_world_size_ == mpi_my_rank_) { // Only take batch assigned to this node (@INFO: Changing seed randomizer across nodes instead of this gives worse results)
@@ -229,7 +272,7 @@ public:
   }
 
   /**
-   * @brief Load models from disk if file exists and setting is not disabled
+   * Load models from disk if file exists and setting is not disabled
    */
   void load() {
     if(!options_->get<bool>("no-reload")) {
@@ -238,28 +281,30 @@ public:
         size_t i = 0;
         if(scheduler_)
           scheduler_->load(init);
-        for(auto graph : graphs_)
-          builders_[i++]->load(graph, init);
+        for(auto graph : clientGraphs_)
+          clientBuilders_[i++]->load(graph, init);
       }
     }
   }
 
   /**
-   * @brief Save model of first client's graph to disk
+   * Save model of first client's graph to disk
    *
+   * @graph graph Graph to save
    * @param final Whether this is the final save
    */
-  void save(bool final = false) { save(graphs_[0], final); }
+  void save(bool final = false) { save(clientGraphs_[0], final); }
 
   /**
-   * @brief Save model of given graph to disk
+   * Save model of given graph to disk.
    *
+   * @param graph Graph to save
    * @param final Whether this is the final save
    */
   void save(Ptr<ExpressionGraph> graph, bool final = false) {
     int idx = 0;
-    for(int i = 0; i < graphs_.size(); ++i) {
-      if(graph == graphs_[i]) {
+    for(int i = 0; i < clientGraphs_.size(); ++i) {
+      if(graph == clientGraphs_[i]) {
         idx = i;
         break;
       }
@@ -268,7 +313,7 @@ public:
     if(options_->get<bool>("overwrite")) {
       std::string name = options_->get<std::string>("model");
 
-      builders_[idx]->save(graphs_[idx], name, true);
+      clientBuilders_[idx]->save(clientGraphs_[idx], name, true);
       if(scheduler_)
         scheduler_->save(name);
     } else {
@@ -281,22 +326,20 @@ public:
         std::string nameOverwrite = name;
         nameOverwrite.replace(
             name.size() - 4, 4, ".iter" + numberOfBatches + ".npz");
-        builders_[idx]->save(graphs_[idx], nameOverwrite);
+        clientBuilders_[idx]->save(clientGraphs_[idx], nameOverwrite);
       }
 
-      builders_[idx]->save(graphs_[idx], name, true);
+      clientBuilders_[idx]->save(clientGraphs_[idx], name, true);
       if(scheduler_)
         scheduler_->save(name);
     }
   }
 
   /**
-   * @brief Collect statistics from first client's graph
-   *
-   * @return Statisticsi of first client's graph
+   * Collect statistics from first client's graph.
    */
   Ptr<data::BatchStats> collectStats() {
-    return builders_[0]->collectStats(graphs_[0]);
+    return clientBuilders_[0]->collectStats(clientGraphs_[0]);
   }
 };
 

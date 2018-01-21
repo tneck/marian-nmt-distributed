@@ -9,13 +9,13 @@ void MultiNodeSparseGraphGroup::initServerShards(bool initFullSendReceiveBuffer)
   // Initialize sizes of clients of every node in cluster
   setupClientSizesOfNodes();
   // Initialize last communicated parameters and delta buffers for all clients of this shard
-  size_t thisNodeSize = this->nodeShardSizes_[this->mpi_my_rank_];
+  size_t thisNodeSize = this->nodeSizes_[this->mpi_my_rank_];
   size_t gpuShardSize = ceilf(((float) thisNodeSize) / this->devices_.size());
   size_t offset = 0;
   for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
     size_t size = std::min(gpuShardSize, thisNodeSize - offset);
     tmpDeltas_.push_back(MultiNodeGraphGroup::newTensor(size, this->devices_[gpu]));
-    int sparseCap = this->graphs_[0]->params()->vals()->size() * 1.2 * (1.0 - dropRate_); // (Estimated) Max size of sparse buffers
+    int sparseCap = this->clientGraphs_[0]->params()->vals()->size() * 1.2 * (1.0 - dropRate_); // (Estimated) Max size of sparse buffers
     // Server side
     shardSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu]))); // @TODO: Sparse sizes can be optimised further
     tmpSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
@@ -31,7 +31,7 @@ void MultiNodeSparseGraphGroup::initServerShards(bool initFullSendReceiveBuffer)
       std::vector<GradientDrop> nodeDroppers;
       for (int client = 0; client < this->numberClientsOfNodes_[node]; client++) {
         Tensor clientTensor = MultiNodeGraphGroup::newTensor(size, this->devices_[gpu]);
-        clientTensor->copyFrom(this->graphs_[0]->params()->vals()->subtensor(offset, size)); // Copy initial shard params into tensor
+        clientTensor->copyFrom(this->clientGraphs_[0]->params()->vals()->subtensor(offset, size)); // Copy initial shard params into tensor
         nodeParams.push_back(clientTensor);
         nodeDroppers.push_back(GradientDrop(new GradientDropBase()));
       }
@@ -45,8 +45,8 @@ void MultiNodeSparseGraphGroup::initServerShards(bool initFullSendReceiveBuffer)
     offset += size;
   }
   // Initialize send/receive buffers
-  serverShardSparseBuffer1_ = std::vector<int>(this->nodeShardSizes_[this->mpi_my_rank_]); // @ TODO: Should actually be sparse(X) instead of X but this causes very sporadic crashes
-  serverShardSparseBuffer2_ = std::vector<float>(this->nodeShardSizes_[this->mpi_my_rank_]);
+  serverShardSparseBuffer1_ = std::vector<int>(this->nodeSizes_[this->mpi_my_rank_]); // @ TODO: Should actually be sparse(X) instead of X but this causes very sporadic crashes
+  serverShardSparseBuffer2_ = std::vector<float>(this->nodeSizes_[this->mpi_my_rank_]);
 }
 
 void MultiNodeSparseGraphGroup::setupClientSizesOfNodes() {
@@ -55,10 +55,10 @@ void MultiNodeSparseGraphGroup::setupClientSizesOfNodes() {
     s += std::to_string(node) + " parameter sharding: ";
 
     clientSizesOfNodes_.push_back(std::vector<size_t>());
-    size_t clientSize = ceilf(((float) this->nodeShardSizes_[node]) / this->numberClientsOfNodes_[node]);
+    size_t clientSize = ceilf(((float) this->nodeSizes_[node]) / this->numberClientsOfNodes_[node]);
     size_t offset = 0;
     for (int client = 0; client < this->numberClientsOfNodes_[node]; client++) {
-      size_t size = min(clientSize, this->nodeShardSizes_[node] - offset);
+      size_t size = min(clientSize, this->nodeSizes_[node] - offset);
       clientSizesOfNodes_[node].push_back(size);
       offset += size;
 
@@ -73,7 +73,7 @@ void MultiNodeSparseGraphGroup::setupClientSizesOfNodes() {
 void MultiNodeSparseGraphGroup::initClientCommunicationVars(bool initBuffers) { // @TODO: Integrate with clients / drop-rate / comm-overlap
   MultiNodeGraphGroup::initClientCommunicationVars(false);
   for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
-    size_t size = this->nodeShardSizes_[this->mpi_my_rank_] * 3 * (1.0 - min(0.99, dropRate_));
+    size_t size = this->nodeSizes_[this->mpi_my_rank_] * 3 * (1.0 - min(0.99, dropRate_));
     clientShardSparseBuffer1_.push_back(std::vector<int>(size));
     clientShardSparseBuffer2_.push_back(std::vector<float>(size));
   }
@@ -99,7 +99,7 @@ void MultiNodeSparseGraphGroup::launchServerThread() {
       size_t offset = 0;
       for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
         size_t endOffset = offset;
-        while (endOffset < messageInfo[this->MSG_INFO_SIZE_] && serverShardSparseBuffer1_.at(endOffset) < gpu * this->localSubShardSizes_[0] + this->localSubShardSizes_[gpu]) {
+        while (endOffset < messageInfo[this->MSG_INFO_SIZE_] && serverShardSparseBuffer1_.at(endOffset) < gpu * this->shardSizes_[0] + this->shardSizes_[gpu]) {
           endOffset++;
         }
 
@@ -112,25 +112,25 @@ void MultiNodeSparseGraphGroup::launchServerThread() {
           cudaStreamSynchronize(0);
 
           // Convert back to dense, for all index + offset >= 0
-          shardSparseGrads_[gpu]->toDense(this->gpuShardsGrads_[gpu], -(this->localSubShardSizes_[0] * gpu));
+          shardSparseGrads_[gpu]->toDense(this->shardGrads_[gpu], -(this->shardSizes_[0] * gpu));
           cudaStreamSynchronize(0);
 
           // Run optimizer on GPU
           if (this->scaleLearningRate_ && batchWords > 0) {
-            this->gpuShardsOpts_[gpu]->update(this->gpuShardsParams_[gpu], this->gpuShardsGrads_[gpu], batchWords / this->avgBatchWords_);
+            this->shardOptimizers_[gpu]->update(this->shardParams_[gpu], this->shardGrads_[gpu], batchWords / this->avgBatchWords_);
           } else {
-            this->gpuShardsOpts_[gpu]->update(this->gpuShardsParams_[gpu], this->gpuShardsGrads_[gpu]);
+            this->shardOptimizers_[gpu]->update(this->shardParams_[gpu], this->shardGrads_[gpu]);
           }
           cudaStreamSynchronize(0);
 
           // Get deltas = params latest version - params local version
-          Element(functional::_1 = functional::_2 - functional::_3, tmpDeltas_[gpu], this->gpuShardsParams_[gpu], clientsParams_[gpu][status.MPI_SOURCE][client]);
+          Element(functional::_1 = functional::_2 - functional::_3, tmpDeltas_[gpu], this->shardParams_[gpu], clientsParams_[gpu][status.MPI_SOURCE][client]);
           cudaStreamSynchronize(0);
 
           // Get sparse deltas
           fetchDroppers_[gpu][status.MPI_SOURCE][client]->dropGraph(tmpDeltas_[gpu], tmpSparseDeltas_[gpu], dropRate_);
           // Update shard's last communicated parameters for node's client
-          clientsParams_[gpu][status.MPI_SOURCE][client]->copyFrom(this->gpuShardsParams_[gpu]);
+          clientsParams_[gpu][status.MPI_SOURCE][client]->copyFrom(this->shardParams_[gpu]);
 
         }, gpu, offset, endOffset - offset, messageInfo[this->MSG_INFO_CLIENT_], messageInfo[this->MSG_INFO_BATCHWORDS_]));
 
@@ -168,7 +168,7 @@ void MultiNodeSparseGraphGroup::synchronizeWithServerShards(Tensor newGrads, Ten
   #if MPI_FOUND
   size_t offset = 0;
   for (int node = 0; node < this->mpi_comm_world_size_; node++) {
-    size_t nodeSize = this->nodeShardSizes_[node];
+    size_t nodeSize = this->nodeSizes_[node];
 
     // Split sparse grads for node
     Tensor subNewGrads = newGrads->subtensor(offset, nodeSize);
