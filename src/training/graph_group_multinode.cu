@@ -54,10 +54,10 @@ void MultiNodeGraphGroup::init(Ptr<data::Batch> batch) {
  * Setup MPI world size and rank of this node.
  */
 void MultiNodeGraphGroup::setupMPI() {
-#if MPI_FOUND
+  #if MPI_FOUND
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_comm_world_size_);
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_my_rank_);
-#endif
+  #endif
 }
 
 /**
@@ -192,7 +192,7 @@ void MultiNodeGraphGroup::initShardGpuTensors() {
  * Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters.
  */
 void MultiNodeGraphGroup::launchServerThread() {
-#if MPI_FOUND
+  #if MPI_FOUND
   serverShardThread_ = new std::thread([this] {
     int nCommunicatingNodes = mpi_comm_world_size_; // keep track of number of nodes still communicating with this shard
     MPI_Status status;
@@ -241,7 +241,7 @@ void MultiNodeGraphGroup::launchServerThread() {
 
     } while (nCommunicatingNodes != 0);
   });
-#endif
+  #endif
 }
 
 /**
@@ -255,7 +255,7 @@ void MultiNodeGraphGroup::shutDownServerThread() {
  * Launch independent threads which continually synchronize their client's gradients/parameters whenever the respective communication buffers are full.
  */
 void MultiNodeGraphGroup::launchCommOverlapThreads() {
-#if MPI_FOUND
+  #if MPI_FOUND
   for (int gpu = 0; gpu < devices_.size(); gpu++) {
     clientCommThreads_.emplace_back(new std::thread([this](int gpu) {
       do {
@@ -276,7 +276,7 @@ void MultiNodeGraphGroup::launchCommOverlapThreads() {
       } while (!stopClientCommThreads_);
     }, gpu));
   }
-#endif
+  #endif
 }
 
 /**
@@ -300,7 +300,7 @@ void MultiNodeGraphGroup::shutDownCommOverlapThreads() {
  * @param batchWords Number of batch words to pass to server shard optimizers
  */
 void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
-#if MPI_FOUND
+  #if MPI_FOUND
   size_t offset = 0;
   for (int node = 0; node < mpi_comm_world_size_; node++) {
     size_t nodeSize = nodeSizes_[node];
@@ -360,7 +360,7 @@ void MultiNodeGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor ol
 
     offset += nodeSize;
   }
-#endif
+  #endif
 }
 
 /**
@@ -469,13 +469,13 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
  * Notify server shards that this node has finished training.
  */
 void MultiNodeGraphGroup::signalFinishedToServerShards() {
-#if MPI_FOUND
+  #if MPI_FOUND
   unsigned long messageInfo[4];
   messageInfo[MSG_INFO_STATUS_] = STATUS_NODE_FINISHED_;
   for (int node = 0; node < mpi_comm_world_size_; node++) {
     MPI_Ssend(&messageInfo, 4, MPI_UNSIGNED_LONG, node, MPI_TAG_GRAD_PUSH_, MPI_COMM_WORLD);
   }
-#endif
+  #endif
 }
 
 }
