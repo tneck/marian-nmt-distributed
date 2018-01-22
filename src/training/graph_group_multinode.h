@@ -4,6 +4,7 @@
 #include "mpi.h"
 #endif
 
+#include <condition_variable>
 #include <future>
 #include <thread>
 
@@ -25,74 +26,132 @@ public:
 
 protected:
 
-  // Variables inherited from AsyncGraphGroup
+  /**
+   * General variables.
+   */
 
+  /** Whether graph group has been properly initialized with a first batch. */
   bool initialized_{false};
 
-  std::vector<Ptr<models::ModelBase>> clientBuilders_;
-  std::vector<Ptr<ExpressionGraph>> clientGraphs_;
-  std::vector<size_t> devices_;
-
-  Ptr<Scheduler> scheduler_;
-
-  std::mutex mutexClientInit_;
-
-  boost::shared_mutex schedulerMutex_;
-
-  ThreadPool * pool_;
-
+  /** Memory allocators for tensors (GPUs). */
   std::vector<Ptr<TensorAllocator>> allocators_;
 
-  size_t batchIter_ = 0; // For dividing batches amongst nodes
+  /**
+   * Client variables.
+   */
 
-  // MPI variables
+  /** Thread pool to enable clients to run concurrently. */
+  ThreadPool * clientThreadPool_;
 
-  int mpi_my_rank_{0};
-  int mpi_comm_world_size_{1};
+  /** Graph builders for clients (which run forward and backward passes). */
+  std::vector<Ptr<models::ModelBase>> clientBuilders_;
 
-  static const int MPI_TAG_GRAD_PUSH_{0};
-  static const int MPI_TAG_PARAM_PUSH_{5};
+  /** Graphs of clients. */
+  std::vector<Ptr<ExpressionGraph>> clientGraphs_;
 
-  // Server (shard) thread variables
+  /** Devices (GPUs) on this node. */
+  std::vector<size_t> devices_;
 
+  /** Mutex to ensure clients are uniquely assigned to graphs and builders. */
+  std::mutex mutexClientInit_;
+
+  /** Mutex to avoid race conditions in scheduler. */
+  std::mutex schedulerMutex_;
+
+  /** Batch number counter used for evenly distributing mini-batches across nodes. */
+  size_t batchIter_ = 0;
+
+  /**
+   * Server (shard) variables.
+   */
+
+  /** Main server thread that continually receives gradients from a client, copies them to the shards on this node, runs the shard optimizers and then returns the result to that client. */
   std::thread * serverShardThread_;
 
+  /** Main server CPU buffer to enable MPI sending and receiving (GPU -> CPU -> Network -> CPU -> GPU). */
   std::vector<float> serverShardBufferCPU_;
 
-  std::vector<Ptr<OptimizerBase>> shardOptimizers_;
+  /** Parts of the global parameters that are assigned to server shards on this node. */
   std::vector<Tensor> shardParams_;
+
+  /** GPU buffer to store gradients received by this node's server thread, so that they can be applied to the shard parameters. */
   std::vector<Tensor> shardGrads_;
 
-  std::vector<std::mutex> mutexShards_;
+  /** Server shard optimizers used to update global parameters with gradients received from clients. */
+  std::vector<Ptr<OptimizerBase>> shardOptimizers_;
 
-  // Client communication variables
+  /** Mutex to enforce critical sections in server shards. */
+  std::vector<std::mutex> shardMutex_;
 
-  std::vector<std::vector<float>> clientCommBuffersCPU_;
+  /**
+   * Communication variables.
+   */
 
+  /** Number of clients on nodes in MPI world (cluster). */
   std::vector<int> numberClientsOfNodes_;
 
-  std::vector<size_t> nodeSizes_; // Number of params allocated to nodes in comm world
+  /** Number of parameters allocated (sharded) to nodes. */
+  std::vector<size_t> nodeSizes_;
+
+  /** Number of parameters allocated to shards on THIS node. */
   std::vector<size_t> shardSizes_; // Number of params allocated to shards on this node
 
+  /** CPU buffer for sending gradients and receiving parameters via MPI. */
+  std::vector<std::vector<float>> clientCommBuffersCPU_;
+
+  /** MPI rank of this node. */
+  int mpi_my_rank_{0};
+
+  /** Number of nodes in MPI world (cluster). */
+  int mpi_comm_world_size_{1};
+
+  /** Flag to indicate that an MPI message contains gradients (client -> server). */
+  static const int MPI_TAG_GRAD_PUSH_{0};
+
+  /** Flag to indicate that an MPI message contains parameters (server -> client). */
+  static const int MPI_TAG_PARAM_PUSH_{5};
+
+  /** Message info indices: 0 = size; 1 = originating client; 2 = number of batch words; 3 = status of node */
   static const unsigned int MSG_INFO_SIZE_{0}, MSG_INFO_CLIENT_{1}, MSG_INFO_BATCHWORDS_{2}, MSG_INFO_STATUS_{3};
+
+  /** Status of node: 0 = training; 1 = finished. Used to indicate to other nodes whether this node is still training. */
   static const unsigned int STATUS_NODE_TRAINING_{0}, STATUS_NODE_FINISHED_{1};
 
-  // Computations/communication overlap variables
+  /** Whether client computations should continue while gradients and parameters are being exchanged with server shards. */
+  bool clientCommOverlap;
 
-  bool commOverlap_; // Overlapping computation during communication
+  /**
+   * Overlapping communication and computation variables.
+   */
 
+  /** Threads for client communication overlap. They send gradients and receive gradients to/from the server shards when the communication buffer is filled. */
   std::vector<std::thread*> clientCommThreads_;
+
+  /** Flags indicating whether the client overlapping communication threads should stop. */
   bool stopClientCommThreads_{false};
 
+  /** GPU buffer (tensor) to sum up gradients computed by the clients. Used to enable clients to proceed with computations while waiting for communication channel to become available. */
   std::vector<Tensor> clientSummedGradsGPU;
+
+  /** Summed word counts of clients. Used for overlap purposes. */
   std::vector<size_t> clientSummedWordCounts_;
+
+  /** Word counts of clients submitted to overlapping/communication thread for current mini-batch. */
   std::vector<size_t> clientCommittedWordCounts_;
+
+  /** Optimizers used locally by clients to apply gradients from the communication thread to their graph's parameters. */
   std::vector<Ptr<OptimizerBase>> clientLocalOptimizers_;
 
+  /** GPU buffers used by clients to copy gradients to for use by the communication threads. */
   std::vector<Tensor> clientCommOverlapBuffersGPU_;
 
+  /** Flags to indicate whether a client's communication buffer is filled, in which case the communication thread will exchange the data with server shards. */
   std::vector<bool> clientCommOverlapBuffersFilled_;
+
+  /** Mutex to enable communication thread to wait for its buffers to be filled. */
   std::vector<std::mutex> mutexClientCommOverlapBuffersFilled_;
+
+  /** Condition variable to notify communication threads that their buffers have been filled. */
   std::vector<std::condition_variable> cvClientCommOverlapBuffersFilled_;
 
   /**
@@ -115,7 +174,7 @@ protected:
    * Setup clients that will compute gradients and communicate them with the server shards.
    * There is one client per GPU.
    */
-  void setupClients(std::vector<int> deviceConfig, Ptr<data::Batch> batch);
+  void setupClients(Ptr<data::Batch> batch);
 
   /**
    * Initialize the graphs (models) of all clients on this node with the given batch.
@@ -209,17 +268,17 @@ protected:
   /**
    * Load the GPU configuration of this node (i.e. which GPUs to use) and the number of GPUs on the other nodes.
    */
-  void loadDeviceConfig(std::vector<int> deviceConfig) {
-    int index = 0, node = 0, nClientsSeen = 0;
+  void loadDeviceConfig(std::vector<size_t> deviceConfig) {
+    size_t index = 0, node = 0, nClientsSeen = 0;
     numberClientsOfNodes_ = std::vector<int>(mpi_comm_world_size_, 0);
     while (index < deviceConfig.size()) {
       if (numberClientsOfNodes_[node] == 0) {
-        numberClientsOfNodes_[node] = (size_t) deviceConfig[index];
+        numberClientsOfNodes_[node] = deviceConfig[index];
         nClientsSeen = 0;
       }
       else if (nClientsSeen < numberClientsOfNodes_[node]) {
         if (node == mpi_my_rank_) {
-          devices_.push_back((size_t)deviceConfig[index]);
+          devices_.push_back(deviceConfig[index]);
         }
         nClientsSeen++;
       } else {
@@ -237,9 +296,9 @@ public:
    */
   MultiNodeGraphGroup(Ptr<Config> options)
       : GraphGroup(options),
-        commOverlap_{options_->get<bool>("multi-node-overlap")} {
+        clientCommOverlap{options_->get<bool>("multi-node-overlap")} {
     // Set up devices for this node
-    loadDeviceConfig(options_->get<std::vector<int>>("multi-node-devices"));
+    loadDeviceConfig(options_->get<std::vector<size_t>>("devices"));
     // Create builders and graphs for clients.
     for(int i = 0; i < devices_.size(); i++) {
       clientGraphs_.push_back(New<ExpressionGraph>());
@@ -250,22 +309,22 @@ public:
   }
 
   /**
-   * (Destructor) Shut down server shard thread and (if comm. overlap enabled) communication overlap threads
+   * (Destructor) Shut down server shard thread and (if comm. overlap enabled) communication overlap threads.
    */
   virtual ~MultiNodeGraphGroup() {
     if (initialized_) {
-      if (commOverlap_) { shutDownCommOverlapThreads(); }
+      if (clientCommOverlap) { shutDownCommOverlapThreads(); }
       signalFinishedToServerShards(); // notify other nodes that this node has finished training
       shutDownServerThread();
     }
-    delete pool_;
+    delete clientThreadPool_;
   }
 
   /**
    * Update any client model with given batch if batch is assigned to this node.
    */
   void update(Ptr<data::Batch> batch) {
-    if (batchIter_ % mpi_comm_world_size_ == mpi_my_rank_) { // Only take batch assigned to this node (@INFO: Changing seed randomizer across nodes instead of this gives worse results)
+    if (batchIter_ % mpi_comm_world_size_ == mpi_my_rank_) { // Only take batch assigned to this node
       execute(batch);
     }
     batchIter_++;
@@ -276,30 +335,33 @@ public:
    */
   void load() {
     if(!options_->get<bool>("no-reload")) {
-      std::string init = options_->get<std::string>("model");
-      if(boost::filesystem::exists(init)) {
-        size_t i = 0;
+      std::string name = options_->get<std::string>("model");
+
+      if(boost::filesystem::exists(name)) {
         if(scheduler_)
-          scheduler_->load(init);
+          scheduler_->load(name);
+        size_t i = 0;
         for(auto graph : clientGraphs_)
-          clientBuilders_[i++]->load(graph, init);
+          clientBuilders_[i++]->load(graph, name);
+      } else if(options_->has("pretrained-model")) {
+        std::string init = options_->get<std::string>("pretrained-model");
+        LOG(info,
+            "Initialize model weights with the pre-trained model {}",
+            init);
+        size_t i = 0;
+        for(auto graph : clientGraphs_)
+          clientBuilders_[i++]->load(graph, init, false);
       }
     }
   }
 
   /**
    * Save model of first client's graph to disk
-   *
-   * @graph graph Graph to save
-   * @param final Whether this is the final save
    */
   void save(bool final = false) { save(clientGraphs_[0], final); }
 
   /**
    * Save model of given graph to disk.
-   *
-   * @param graph Graph to save
-   * @param final Whether this is the final save
    */
   void save(Ptr<ExpressionGraph> graph, bool final = false) {
     int idx = 0;
@@ -321,8 +383,8 @@ public:
 
       if(!final) {
         std::string numberOfBatches
-            = scheduler_ ? std::to_string(scheduler_->numberOfBatches()) :
-              "unknown";
+            = scheduler_ ? std::to_string(scheduler_->numberOfBatches())
+                         : "unknown";
         std::string nameOverwrite = name;
         nameOverwrite.replace(
             name.size() - 4, 4, ".iter" + numberOfBatches + ".npz");
@@ -341,6 +403,7 @@ public:
   Ptr<data::BatchStats> collectStats() {
     return clientBuilders_[0]->collectStats(clientGraphs_[0]);
   }
+
 };
 
 }
