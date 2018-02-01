@@ -131,7 +131,7 @@ protected:
   bool stopClientCommThreads_{false};
 
   /** GPU buffer (tensor) to sum up gradients computed by the clients. Used to enable clients to proceed with computations while waiting for communication channel to become available. */
-  std::vector<Tensor> clientSummedGradsGPU;
+  std::vector<Tensor> clientSummedGradsGPU_;
 
   /** Summed word counts of clients. Used for overlap purposes. */
   std::vector<size_t> clientSummedWordCounts_;
@@ -163,7 +163,7 @@ protected:
    * Setup training environment and launch server thread and (if enabled) client communication overlap threads..
    * Includes setting up MPI, node and shard sizes, clients, server shards and communication overlap stuff.
    */
-  virtual void init(Ptr<data::Batch> batch);
+  void init(Ptr<data::Batch> batch);
 
   /**
    * Setup MPI world size and rank of this node.
@@ -191,7 +191,7 @@ protected:
    * Initialize a CPU buffer for each client on this node for storing gradients or parameters.
    * Required for sending GPU data through MPI to other nodes (GPU -> CPU -> MPI network).
    */
-  void initClientCpuBuffers();
+  virtual void initClientCpuBuffers();
 
   /**
    * Initialize variables required for overlapping client computations and communication.
@@ -220,7 +220,13 @@ protected:
   /**
    * Initialize the GPU tensors for storing the parameters and gradients of each server shard.
    */
-  void initShardGpuTensors();
+  virtual void initShardGpuTensors();
+
+  /**
+   * Initialize a CPU buffer for storing gradients received by clients and parameters copied from the GPUs.
+   * Required for sending GPU data through MPI to other nodes (GPU -> CPU -> MPI network -> CPU -> GPU).
+   */
+  virtual void initShardCpuBuffers();
 
   /**
    * Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters.

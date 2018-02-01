@@ -103,7 +103,7 @@ void MultiNodeGraphGroup::calculateNodeSizes() {
 
 /**
  * Initialize a CPU buffer for each client on this node for storing gradients or parameters.
- * Required for sending GPU data through MPI to other nodes (GPU -> CPU -> MPI network).
+ * Required for sending GPU data through MPI to other nodes (GPU -> CPU -> MPI network -> CPU -> GPU).
  */
 void MultiNodeGraphGroup::initClientCpuBuffers() {
   // Initialize CPU buffers used to send GPU data through MPI (can't send directly from GPUs)
@@ -139,7 +139,7 @@ void MultiNodeGraphGroup::initClientCommOverlapGpuTensors() {
     // Gradients local sum buffer
     Tensor sumGrads = newTensor(modelSize, devices_[client]);
     sumGrads->set(0);
-    clientSummedGradsGPU.push_back(sumGrads);
+    clientSummedGradsGPU_.push_back(sumGrads);
     // Local optimizer to apply summed gradients
     clientLocalOptimizers_.push_back(Optimizer(options_)); // => for simple SGD opt: clientLocalOptimizers_.push_back(Optimizer<Sgd>(0.0001, keywords::clip=Clipper<Norm>(1)));
   }
@@ -151,9 +151,8 @@ void MultiNodeGraphGroup::initClientCommOverlapGpuTensors() {
  */
 void MultiNodeGraphGroup::setupServerShards() {
   calculateShardSizes();
+  initShardCpuBuffers();
   initShardGpuTensors();
-  // CPU buffer for receiving/sending grads/params
-  serverShardBufferCPU_ = std::vector<float>(nodeSizes_[mpi_my_rank_]);
   // Shard optimizers
   for (int shard = 0; shard < devices_.size(); shard++) {
     shardOptimizers_.push_back(Optimizer(options_));
@@ -186,6 +185,15 @@ void MultiNodeGraphGroup::initShardGpuTensors() {
     shardParams_.push_back(gpuParams);
     shardGrads_.push_back(newTensor(shardSizes_[shard], devices_[shard]));
   }
+}
+
+/**
+ * Initialize a CPU buffer for storing gradients received by clients and parameters copied from the GPUs.
+ * Required for sending GPU data through MPI to other nodes (GPU -> CPU -> MPI network -> CPU -> GPU).
+ */
+void MultiNodeGraphGroup::initShardCpuBuffers() {
+  // CPU buffer for receiving/sending grads/params
+  serverShardBufferCPU_ = std::vector<float>(nodeSizes_[mpi_my_rank_]);
 }
 
 /**
@@ -404,7 +412,7 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
     if (clientCommOverlap) {
 
       // Add computed gradients to local running sum
-      Element(functional::_1 = functional::_1 + functional::_2, clientSummedGradsGPU[my_id], graph->params()->grads());
+      Element(functional::_1 = functional::_1 + functional::_2, clientSummedGradsGPU_[my_id], graph->params()->grads());
       cudaStreamSynchronize(0);
       // Sum up word counts if batch flexible learning rate is enabled
       if (scaleLearningRate_) {
@@ -418,7 +426,7 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
           // Copy parameters from communication buffer
           graph->params()->vals()->copyFrom(clientCommOverlapBuffersGPU_[my_id]);
           // Copy summed grads to communication buffer
-          clientCommOverlapBuffersGPU_[my_id]->copyFrom(clientSummedGradsGPU[my_id]);
+          clientCommOverlapBuffersGPU_[my_id]->copyFrom(clientSummedGradsGPU_[my_id]);
           // Commit summed word counts if batch-flexible-lr enabled
           if (scaleLearningRate_) {
             clientCommittedWordCounts_[my_id] = clientSummedWordCounts_[my_id];
@@ -428,9 +436,9 @@ void MultiNodeGraphGroup::execute(Ptr<data::Batch> batch) {
           clientCommOverlapBuffersFilled_[my_id] = true;
           cvClientCommOverlapBuffersFilled_[my_id].notify_one();
           // Apply summed gradients to new parameters
-          clientLocalOptimizers_[my_id]->update(graph->params()->vals(), clientSummedGradsGPU[my_id]);
+          clientLocalOptimizers_[my_id]->update(graph->params()->vals(), clientSummedGradsGPU_[my_id]);
           // Clear summed gradients
-          clientSummedGradsGPU[my_id]->set(0);
+          clientSummedGradsGPU_[my_id]->set(0);
         }
       }
     }
