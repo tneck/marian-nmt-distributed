@@ -4,6 +4,7 @@
 #include "training/graph_group_async_drop.h"
 #include "training/graph_group_singleton.h"
 #include "training/graph_group_multinode.h"
+#include "training/graph_group_multinode_drop.h"
 #include "training/graph_group_sync.h"
 #include "training/training.h"
 
@@ -24,8 +25,13 @@ int main(int argc, char** argv) {
   bool useMultiNode = options->get<bool>("multi-node") && configureMPI(argc, argv);
 
   if(useMultiNode) {
-    LOG(info, "Launching Multi-Node Graph Group");
-    New<Train<MultiNodeGraphGroup>>(options)->run();
+    if(options->get<float>("grad-dropping-rate") > 0.0) {
+      LOG(info, "Launching Sparse Multi-Node Graph Group");
+      New<Train<MultiNodeSparseGraphGroup>>(options)->run();
+    } else {
+      LOG(info, "Launching Multi-Node Graph Group");
+      New<Train<MultiNodeGraphGroup>>(options)->run();
+    }
   } else if(devices.size() > 1) {
     if(options->get<bool>("sync-sgd"))
       New<Train<SyncGraphGroup>>(options)->run();

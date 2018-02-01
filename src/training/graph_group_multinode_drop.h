@@ -12,6 +12,7 @@
 #include "3rd_party/threadpool.h"
 #include "training/dropper.h"
 #include "training/sparse_tensor.h"
+
 #if MPI_FOUND
 #include "mpi.h"
 #endif
@@ -22,7 +23,10 @@ namespace marian {
  * @brief Multi-node graph group for asynchronous training over multiple machines each with one or multiple GPUs
  */
 class MultiNodeSparseGraphGroup : public MultiNodeGraphGroup {
-private:
+public:
+  virtual void setScheduler(Ptr<Scheduler> scheduler) { MultiNodeGraphGroup::setScheduler(scheduler); }
+
+protected:
 
   /**
    * General variables.
@@ -95,10 +99,9 @@ private:
   virtual void initClientCpuBuffers();
 
   /**
-   * Initialize GPU tensors required for overlapping client computations and communication.
-   * Includes secondary buffers for params/grads, buffers for locally summing gradients, and local optimizers to apply received gradients to client parameters.
+   * Initialize GPU tensors required for sparse communication.
    */
-  virtual void initClientCommOverlapGpuTensors();
+  void initClientSparseGpuTensors();
 
   /**
    * Initialize the GPU tensors for storing the parameters and gradients of each server shard.
@@ -111,17 +114,17 @@ private:
   virtual void initShardCpuBuffers();
 
   /**
-   * @brief Determine size for all clients of every node
+   * Determine size for all clients of every node.
    */
   void setupClientSizesOfNodes();
 
   /**
-   * @brief Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters
+   * Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters.
    */
   virtual void launchServerThread();
 
   /**
-   * @brief Send new gradients to the server shards and receive the updated (global) parameters
+   * Send new gradients to the server shards and receive the updated (global) parameters
    *
    * @param newGrads Gradients to send
    * @param oldParams Parameters to replace
@@ -133,19 +136,24 @@ private:
 
 
   /**
-   * @brief Notify server shards that this node has finished training
+   * Notify server shards that this node has finished training
    */
   virtual void signalFinishedToServerShards();
 
 public:
 
   /**
-   * @brief (Constructor) Configure settings and initialize graphs, shard optimizers, local optimizers, graph builders, etc. and their associated variables
+   * (Constructor) Call super class and initialize drop-rate setting.
    */
   template <class... Args>
   MultiNodeSparseGraphGroup(Ptr<Config> options, Args... args)
       : MultiNodeGraphGroup(options),
         dropRate_{options->get<double>("grad-dropping-rate")} {}
+
+  /**
+   * (Destructor) Propogate destruction to any derived classes before destructor of parent is called.
+   */
+  virtual ~MultiNodeSparseGraphGroup() {}
 
 };
 

@@ -1,22 +1,33 @@
-#include "training/graph_group_multinode_sparse.h"
-
+#include "training/graph_group_multinode_drop.h"
 #include "kernels/tensor_operators.h"
 
 namespace marian {
 
+/**
+ * Initialize a CPU buffer for each client on this node for storing gradients or deltas.
+ * Required for sending GPU data through MPI to other nodes (GPU -> CPU -> MPI network -> CPI -> GPU).
+ */
 void MultiNodeSparseGraphGroup::initClientCpuBuffers() {
+  size_t size = this->nodeSizes_[this->mpi_my_rank_] * 3 * (1.0 - std::min(0.99, dropRate_)); // @TODO: Remove std::min (look at async_drop)
   for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
-    size_t size = this->nodeSizes_[this->mpi_my_rank_] * 3 * (1.0 - std::min(0.99, dropRate_));
     clientSparseIndicesCPU_.push_back(std::vector<int>(size));
     clientSparseFloatsCPU_.push_back(std::vector<float>(size));
   }
 }
 
-void MultiNodeSparseGraphGroup::initClientCommOverlapGpuTensors() {
-  // @TODO
+
+/**
+ * Initialize GPU tensors required for sparse communication.
+ */
+void MultiNodeSparseGraphGroup::initClientSparseGpuTensors() {
+
 }
 
+/**
+ * Initialize the GPU tensors for storing the parameters and gradients of each server shard.
+ */
 void MultiNodeSparseGraphGroup::initShardGpuTensors() {
+  MultiNodeGraphGroup::initShardGpuTensors();
   // Initialize sizes of clients of every node in cluster
   setupClientSizesOfNodes();
   // Initialize last communicated parameters and delta buffers for all clients of this shard
@@ -57,11 +68,17 @@ void MultiNodeSparseGraphGroup::initShardGpuTensors() {
   }
 }
 
+/**
+ * Initialize the CPU buffers for storing gradients received and parameters sent of each server shard.
+ */
 void MultiNodeSparseGraphGroup::initShardCpuBuffers() {
   serverShardSparseIndicesCPU_ = std::vector<int>(this->nodeSizes_[this->mpi_my_rank_]); // @TODO: Should actually be slightly larger than sparse(X) instead of X
   serverShardSparseFloatsCPU_ = std::vector<float>(this->nodeSizes_[this->mpi_my_rank_]);
 }
 
+/**
+ * Determine size for all clients of every node.
+ */
 void MultiNodeSparseGraphGroup::setupClientSizesOfNodes() {
   for (int node = 0; node < this->mpi_comm_world_size_; node++) {
     nodeClientSizes_.push_back(std::vector<size_t>());
@@ -75,6 +92,9 @@ void MultiNodeSparseGraphGroup::setupClientSizesOfNodes() {
   }
 }
 
+/**
+ * Launch independent thread which continually receives gradients assigned to this shard from any client, runs the shard optimizer and sends back the updated parameters.
+ */
 void MultiNodeSparseGraphGroup::launchServerThread() {
   #if MPI_FOUND
   this->serverShardThread_ = new std::thread([this] {
@@ -160,6 +180,15 @@ void MultiNodeSparseGraphGroup::launchServerThread() {
   #endif
 }
 
+/**
+ * Send new gradients to the server shards and receive the updated (global) parameters
+ *
+ * @param newGrads Gradients to send
+ * @param oldParams Parameters to replace
+ * @param gpu GPU/client performing synchronize (to access appropriate buffers etc.)
+ * @param batchWords Number of batch words to pass to server shard optimizers
+ * @param optionalBlockMutex Optional mutex that has to be locked during synchronization
+ */
 void MultiNodeSparseGraphGroup::synchronizeWithServerShards(Tensor newGrads, Tensor oldParams, int gpu, size_t batchWords) {
   #if MPI_FOUND
   size_t offset = 0;
@@ -220,6 +249,9 @@ void MultiNodeSparseGraphGroup::synchronizeWithServerShards(Tensor newGrads, Ten
   #endif
 }
 
+/**
+ * Notify server shards that this node has finished training
+ */
 void MultiNodeSparseGraphGroup::signalFinishedToServerShards() {
 #if MPI_FOUND
   unsigned long messageInfo[4];
