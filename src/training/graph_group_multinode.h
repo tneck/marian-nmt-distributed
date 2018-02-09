@@ -168,7 +168,12 @@ protected:
   /**
    * Setup MPI world size and rank of this node.
    */
-  void setupMPI();
+  void setupMPI() {
+    #if MPI_FOUND
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_comm_world_size_);
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_my_rank_);
+    #endif
+  }
 
   /**
    * Setup clients that will compute gradients and communicate them with the server shards.
@@ -304,6 +309,7 @@ public:
       : GraphGroup(options),
         clientCommOverlap{options_->get<bool>("multi-node-overlap")} {
     // Set up devices for this node
+    setupMPI();
     loadDeviceConfig(options_->get<std::vector<size_t>>("devices"));
     // Create builders and graphs for clients.
     for(int i = 0; i < devices_.size(); i++) {

@@ -36,7 +36,6 @@ Tensor MultiNodeGraphGroup::newTensor(int size, int device) {
  */
 void MultiNodeGraphGroup::init(Ptr<data::Batch> batch) {
   // Setup clients and shards
-  setupMPI();
   setupClients(batch);
   setupServerShards();
   if (clientCommOverlap) {
@@ -48,16 +47,6 @@ void MultiNodeGraphGroup::init(Ptr<data::Batch> batch) {
   if (clientCommOverlap) {
     launchCommOverlapThreads(); // For communicating with server shards while other threads do computations
   }
-}
-
-/**
- * Setup MPI world size and rank of this node.
- */
-void MultiNodeGraphGroup::setupMPI() {
-  #if MPI_FOUND
-  MPI_Comm_size(MPI_COMM_WORLD, &mpi_comm_world_size_);
-  MPI_Comm_rank(MPI_COMM_WORLD, &mpi_my_rank_);
-  #endif
 }
 
 /**
