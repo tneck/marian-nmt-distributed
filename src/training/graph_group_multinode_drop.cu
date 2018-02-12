@@ -15,12 +15,16 @@ void MultiNodeSparseGraphGroup::initClientCpuBuffers() {
   }
 }
 
-
 /**
- * Initialize GPU tensors required for sparse communication.
- */
-void MultiNodeSparseGraphGroup::initClientSparseGpuTensors() {
-
+* Initialize the GPU tensors, i.e. graphs (models), of all clients on this node using the given batch, including required sparse tensors.
+*/
+void MultiNodeSparseGraphGroup::initClientGpuTensors(Ptr<data::Batch> batch) {
+  MultiNodeGraphGroup::initClientGpuTensors(batch);
+  int sparseCap = this->clientGraphs_[0]->params()->vals()->size() * 1.2 * (1.0 - dropRate_); // (Estimated) Max size of sparse buffers
+  for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
+    clientSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
+    clientSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
+  }
 }
 
 /**
@@ -34,16 +38,12 @@ void MultiNodeSparseGraphGroup::initShardGpuTensors() {
   size_t thisNodeSize = this->nodeSizes_[this->mpi_my_rank_];
   size_t gpuShardSize = ceilf(((float) thisNodeSize) / this->devices_.size());
   size_t offset = 0;
+  int sparseCap = this->clientGraphs_[0]->params()->vals()->size() * 1.2 * (1.0 - dropRate_); // (Estimated) Max size of sparse buffers
   for (int gpu = 0; gpu < this->devices_.size(); gpu++) {
     size_t size = std::min(gpuShardSize, thisNodeSize - offset);
     shardComputedDeltas_.push_back(MultiNodeGraphGroup::newTensor(size, this->devices_[gpu]));
-    int sparseCap = this->clientGraphs_[0]->params()->vals()->size() * 1.2 * (1.0 - dropRate_); // (Estimated) Max size of sparse buffers
-    // Server side
     shardSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu]))); // @TODO: Sparse sizes can be optimised further
     shardSparseComputedDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
-    // Client side
-    clientSparseGrads_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
-    clientSparseDeltas_.push_back(SparseTensor(new SparseTensorBase(sparseCap, this->devices_[gpu])));
     // Initialize parameters communicated with all external clients of this server shard (to compute deltas) + gradient droppers
     std::vector<std::vector<Tensor>> extClientParams; // parameters stored for external clients
     std::vector<std::vector<GradientDrop>> extClientDroppers;

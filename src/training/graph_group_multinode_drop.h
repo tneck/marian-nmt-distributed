@@ -98,10 +98,10 @@ protected:
    */
   virtual void initClientCpuBuffers();
 
-  /**
-   * Initialize GPU tensors required for sparse communication.
-   */
-  void initClientSparseGpuTensors();
+ /**
+ * Initialize the GPU tensors, i.e. graphs (models), of all clients on this node using the given batch, including required sparse tensors.
+ */
+  virtual void initClientGpuTensors(Ptr<data::Batch> batch);
 
   /**
    * Initialize the GPU tensors for storing the parameters and gradients of each server shard.

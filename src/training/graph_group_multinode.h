@@ -181,10 +181,11 @@ protected:
    */
   void setupClients(Ptr<data::Batch> batch);
 
+
   /**
-   * Initialize the graphs (models) of all clients on this node with the given batch.
-   */
-  void runBatchThroughClientGraphs(Ptr<data::Batch> batch);
+  * Initialize the GPU tensors, i.e. graphs (models), of all clients on this node using the given batch.
+  */
+  virtual void initClientGpuTensors(Ptr<data::Batch> batch);
 
   /**
    * Calculate the size of each node in the MPI world (cluster).

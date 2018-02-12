@@ -54,7 +54,7 @@ void MultiNodeGraphGroup::init(Ptr<data::Batch> batch) {
  * There is one client per GPU.
  */
 void MultiNodeGraphGroup::setupClients(Ptr<data::Batch> batch) {
-  runBatchThroughClientGraphs(batch);
+  initClientGpuTensors(batch);
   calculateNodeSizes();
   initClientCpuBuffers();
   if(clientCommOverlap) {
@@ -65,9 +65,9 @@ void MultiNodeGraphGroup::setupClients(Ptr<data::Batch> batch) {
 }
 
 /**
- * Initialize the graphs (models) of all clients on this node with the given batch.
+ * Initialize the GPU tensors, i.e. graphs (models), of all clients on this node using the given batch.
  */
-void MultiNodeGraphGroup::runBatchThroughClientGraphs(Ptr<data::Batch> batch) {
+void MultiNodeGraphGroup::initClientGpuTensors(Ptr<data::Batch> batch) {
   for(int i = 0; i < devices_.size(); i++) {
     THREAD_GUARD(
         clientBuilders_[i]->build(clientGraphs_[i], batch);
